@@ -14,46 +14,76 @@ logger = logging.getLogger(__name__)
 STYLE_PRESETS = {
     "phonk": {
         "visualizer_type": "bars",
-        "visualizer_position": "bottom",
-        "visualizer_color": "#cc44ff",
-        "visualizer_height": 80,
-        "color_filter": "dark_purple",
-        "effects": {"film_grain": True, "vignette": True, "vhs": True},
-        "transition_style": "cut",
-        "contrast_boost": 1.3,
-        "saturation": 0.7,
-        "brightness": 0.85,
+        "visualizer_position": "bottom_overlay",
+        "visualizer_color": "purple",
     },
     "japanese": {
         "visualizer_type": "waveform",
-        "visualizer_position": "top",
-        "visualizer_color": "#ff2244",
-        "visualizer_height": 60,
-        "color_filter": "neon_blue",
-        "effects": {"vignette": True, "chromatic_aberration": True, "bloom": True},
-        "transition_style": "crossfade",
-        "contrast_boost": 1.4,
-        "saturation": 1.2,
-        "brightness": 0.9,
+        "visualizer_position": "top_overlay",
+        "visualizer_color": "red",
     },
     "house": {
-        "visualizer_type": "circular",
+        "visualizer_type": "bars",
         "visualizer_position": "center_bottom",
-        "visualizer_color": "#ffaa44",
-        "visualizer_height": 100,
-        "color_filter": "warm_gold",
-        "effects": {"bloom": True},
-        "transition_style": "crossfade",
-        "contrast_boost": 1.1,
-        "saturation": 1.3,
-        "brightness": 1.05,
+        "visualizer_color": "gold",
     },
 }
 
-COLOR_FILTERS = {
-    "dark_purple": "curves=r='0/0 128/80 255/200':g='0/0 128/60 255/150':b='0/0 128/120 255/220'",
-    "neon_blue": "curves=r='0/0 128/60 255/160':g='0/0 128/80 255/180':b='0/0 128/140 255/255'",
-    "warm_gold": "curves=r='0/0 128/140 255/255':g='0/0 128/120 255/220':b='0/0 128/60 255/150'",
+LOOK_FILTERS = {
+    "dark_purple": "curves=r='0/0 .5/.31 1/.78':g='0/0 .5/.24 1/.59':b='0/0 .5/.47 1/.86'",
+    "neon_blue": "curves=r='0/0 .5/.24 1/.63':g='0/0 .5/.31 1/.71':b='0/0 .5/.55 1/1'",
+    "warm_gold": "curves=r='0/0 .5/.55 1/1':g='0/0 .5/.47 1/.86':b='0/0 .5/.24 1/.59'",
+}
+
+VISUALIZER_COLORS = {
+    "purple": "cc44ff",
+    "red": "ff2244",
+    "blue": "3388ff",
+    "gold": "ffaa44",
+    "white": "ffffff",
+    "cyan": "22ddff",
+    "pink": "ff55bb",
+}
+
+VISUALIZER_HEIGHTS = {"small": 60, "medium": 90, "large": 130}
+
+EFFECTS_REGISTRY = {
+    "high_contrast": {
+        "title": "High contrast", "emoji": "◐", "category": "Color / Look",
+        "stable": True, "filter": "eq=contrast=1.20",
+    },
+    "saturation_boost": {
+        "title": "Saturation boost", "emoji": "🌈", "category": "Color / Look",
+        "stable": True, "filter": "eq=saturation=1.25",
+    },
+    "dark_phonk_grade": {
+        "title": "Dark phonk grade", "emoji": "🌑", "category": "Color / Look",
+        "stable": True, "filter": LOOK_FILTERS["dark_purple"],
+    },
+    "cold_neon_grade": {
+        "title": "Cold neon grade", "emoji": "🧊", "category": "Color / Look",
+        "stable": True, "filter": LOOK_FILTERS["neon_blue"],
+    },
+    "warm_gold_grade": {
+        "title": "Warm gold grade", "emoji": "🌅", "category": "Color / Look",
+        "stable": True, "filter": LOOK_FILTERS["warm_gold"],
+    },
+    "film_grain": {
+        "title": "Film grain", "emoji": "🎞", "category": "Texture",
+        "stable": True, "filter": "noise=alls=12:allf=t+u",
+    },
+    "vignette": {
+        "title": "Vignette", "emoji": "🌘", "category": "Texture",
+        "stable": True, "filter": "vignette=angle=0.18",
+    },
+    "scanlines": {
+        "title": "Scanlines", "emoji": "▤", "category": "Texture",
+        "stable": True, "filter": "drawgrid=w=iw:h=4:t=1:c=black@0.16",
+    },
+    "chromatic_aberration": {
+        "title": "Chromatic aberration", "emoji": "⚡", "category": "Energy FX",
+        "stable": True, "filter": "rgbashift=rh=3:bh=-3",
+    },
 }
 
 DEFAULT_MONTAGE_CONFIG = {
@@ -66,14 +96,6 @@ DEFAULT_MONTAGE_CONFIG = {
     "clip_order_mode": "visual_match",
 }
 
-IMPLEMENTED_EFFECTS = {
-    "film_grain",
-    "vignette",
-    "chromatic_aberration",
-    "vhs",
-    "bloom",
-}
-UNSUPPORTED_EFFECTS = {"rain", "sparkles", "flash"}
 
 
 def analyze_clip(clip_path: str) -> dict | None:
@@ -216,24 +238,35 @@ def normalize_visualizer_config(config: dict | None, preset: dict) -> dict:
         "enabled": bool(config.get("enabled", True)),
         "type": config.get("type", preset["visualizer_type"]),
         "position": config.get("position", preset["visualizer_position"]),
-        "height": config.get("height", preset["visualizer_height"]),
+        "size": config.get("size", "medium"),
+        "background_opacity": config.get("background_opacity", "none"),
+        "color": config.get("color", preset["visualizer_color"]),
+        "glow": config.get("glow", "soft"),
     }
-    if result["type"] not in {"bars", "waveform", "circular"}:
+    if result["type"] not in {"bars", "waveform"}:
         result["type"] = preset["visualizer_type"]
-    if result["position"] not in {"bottom", "top", "center_bottom"}:
+    legacy_positions = {"bottom": "bottom_overlay", "top": "top_overlay"}
+    result["position"] = legacy_positions.get(result["position"], result["position"])
+    if result["position"] not in {"bottom_overlay", "top_overlay", "center_bottom", "embedded_strip"}:
         result["position"] = preset["visualizer_position"]
-    if result["height"] not in {60, 80, 100, 120}:
-        result["height"] = preset["visualizer_height"]
+    if result["size"] not in VISUALIZER_HEIGHTS:
+        result["size"] = "medium"
+    if result["background_opacity"] not in {"none", "soft", "medium"}:
+        result["background_opacity"] = "none"
+    if result["color"] not in VISUALIZER_COLORS:
+        result["color"] = preset["visualizer_color"]
+    if result["glow"] not in {"off", "soft", "strong"}:
+        result["glow"] = "soft"
+    result["height"] = VISUALIZER_HEIGHTS[result["size"]]
     return result
 
 
 def normalize_effects_config(config: dict | None, preset: dict) -> dict:
-    selected = {key: bool(value) for key, value in preset.get("effects", {}).items()}
-    selected.update({key: bool(value) for key, value in (config or {}).items()})
-    ignored = sorted(key for key in UNSUPPORTED_EFFECTS if selected.get(key))
+    config = config or {}
+    ignored = sorted(key for key, value in config.items() if value and key not in EFFECTS_REGISTRY)
     if ignored:
         logger.warning("Unsupported effects ignored: %s", ", ".join(ignored))
-    return {key: selected.get(key, False) for key in IMPLEMENTED_EFFECTS}
+    return {key: bool(config.get(key, False)) for key in EFFECTS_REGISTRY}
 
 
 def segment_duration_for_mode(bpm: float, mode: str, style: str) -> float:
@@ -299,25 +332,11 @@ def prepare_clip_variant(clip: dict, tmpdir: str, variant: str, target_duration:
 def build_effects_filter(preset: dict, effects: dict) -> str:
     if not any(effects.values()):
         return "null"
-    filters = []
-    color_filter_name = preset.get("color_filter")
-    if color_filter_name in COLOR_FILTERS:
-        filters.append(COLOR_FILTERS[color_filter_name])
-    contrast = preset.get("contrast_boost", 1.0) + random.uniform(-0.05, 0.05)
-    saturation = preset.get("saturation", 1.0) + random.uniform(-0.05, 0.05)
-    brightness = preset.get("brightness", 1.0) + random.uniform(-0.03, 0.03)
-    filters.append(f"eq=contrast={contrast:.2f}:saturation={saturation:.2f}:brightness={brightness:.2f}")
-    if effects.get("film_grain"):
-        filters.append(f"noise=alls={random.uniform(8, 18):.0f}:allf=t+u")
-    if effects.get("vignette"):
-        filters.append(f"vignette=angle={random.uniform(0.1, 0.3):.2f}")
-    if effects.get("chromatic_aberration"):
-        shift = random.randint(2, 5)
-        filters.append(f"rgbashift=rh={shift}:bh=-{shift}")
-    if effects.get("vhs"):
-        filters.append("unsharp=5:5:0.8:3:3:0.4")
-    if effects.get("bloom"):
-        filters.append("gblur=sigma=2")
+    filters = [
+        details["filter"]
+        for effect_id, details in EFFECTS_REGISTRY.items()
+        if effects.get(effect_id) and details["stable"]
+    ]
     return ",".join(filters) if filters else "null"
 
 
@@ -325,22 +344,59 @@ def generate_visualizer(audio_path: str, output_path: str, preset: dict, config:
                         width: int, height: int, duration: float) -> bool:
     vis_type = config["type"]
     vis_h = config["height"]
-    color = preset["visualizer_color"].lstrip("#")
+    color = VISUALIZER_COLORS[config["color"]]
     if vis_type == "bars":
         vis_filter = (
-            f"showfreqs=s={width}x{vis_h}:win_size=2048:ascale=log:"
-            f"fscale=log:colors=0x{color}|0x{color}:mode=bar"
+            f"showfreqs=s={width}x{vis_h}:win_size=1024:ascale=sqrt:"
+            f"fscale=log:colors=0x{color}|0x{color}:mode=bar:cmode=combined"
         )
-    elif vis_type == "waveform":
-        vis_filter = f"showwaves=s={width}x{vis_h}:mode=cline:colors=0x{color}:scale=sqrt"
     else:
-        vis_filter = f"showcqt=s={width}x{vis_h}:count=1:csp=bt709:bar_g=2:sono_g=4"
+        vis_filter = f"showwaves=s={width}x{vis_h}:mode=cline:colors=0x{color}:scale=sqrt"
     cmd = [
         "ffmpeg", "-y", "-i", audio_path, "-filter_complex", f"[0:a]{vis_filter}[vis]",
         "-map", "[vis]", "-c:v", "libx264", "-preset", "fast", "-crf", "20",
         "-t", str(duration), output_path,
     ]
     return run_ffmpeg(cmd, "Visualizer", 300).returncode == 0
+
+
+def build_visualizer_overlay_filter(config: dict, width: int, height: int) -> str:
+    """Create a transparent full-frame overlay chain for a generated visualizer."""
+    vis_h = config["height"]
+    if config["position"] == "top_overlay":
+        overlay_y = 18
+    elif config["position"] == "center_bottom":
+        overlay_y = max(0, height - vis_h - 60)
+    elif config["position"] == "embedded_strip":
+        overlay_y = max(0, height - vis_h)
+    else:
+        overlay_y = max(0, height - vis_h - 18)
+
+    if config["position"] == "embedded_strip":
+        alpha = {"none": 0.45, "soft": 0.65, "medium": 0.85}[config["background_opacity"]]
+        box_y, box_h = overlay_y, vis_h
+    else:
+        alpha = {"none": 0.0, "soft": 0.18, "medium": 0.34}[config["background_opacity"]]
+        box_y, box_h = max(0, overlay_y - 6), min(height, vis_h + 12)
+
+    parts = []
+    if alpha:
+        parts.append(
+            f"[0:v]drawbox=x=0:y={box_y}:w=iw:h={box_h}:color=black@{alpha:.2f}:t=fill[base]"
+        )
+    else:
+        parts.append("[0:v]null[base]")
+    parts.append("[1:v]format=rgba,colorkey=0x000000:0.18:0.06[vis]")
+
+    if config["glow"] == "off":
+        parts.append(f"[base][vis]overlay=0:{overlay_y}[out]")
+    else:
+        sigma, glow_alpha = (5, 0.45) if config["glow"] == "soft" else (10, 0.65)
+        parts.append("[vis]split[vmain][vglow]")
+        parts.append(f"[vglow]gblur=sigma={sigma},colorchannelmixer=aa={glow_alpha:.2f}[glow]")
+        parts.append(f"[base][glow]overlay=0:{overlay_y}[withglow]")
+        parts.append(f"[withglow][vmain]overlay=0:{overlay_y}[out]")
+    return ";".join(parts)
 
 
 def build_crossfade_filter(segment_durations: list, effects_filter: str, transition: str) -> tuple[str, str]:
@@ -409,12 +465,10 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
     if not clips:
         raise ValueError("Не удалось проанализировать видеоклипы")
 
-    if progress_callback:
-        progress_callback("Анализирую аудио и определяю темп...")
     bpm, beat_times, audio_duration = detect_beats(audio_path)
     logger.info("Audio duration %.2fs, BPM %.2f, detected beats %d", audio_duration, bpm, len(beat_times))
     if progress_callback:
-        progress_callback(f"Определены BPM {bpm:.0f} и длительность {audio_duration:.1f} сек.")
+        progress_callback(f"30% Audio and BPM analyzed: {bpm:.0f} BPM, {audio_duration:.1f} sec.")
 
     target_duration = segment_duration_for_mode(bpm, montage["beat_cut_mode"], style)
     width, height = clips[0]["width"], clips[0]["height"]
@@ -437,7 +491,7 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
         elapsed += segment_duration - (overlap if len(sequence) > 1 else 0.0)
     logger.info("Final sequence length: %d segments, target duration %.3fs", len(sequence), target_duration)
     if progress_callback:
-        progress_callback(f"Построена последовательность монтажа: {len(sequence)} сегментов.")
+        progress_callback(f"45% Montage plan built: {len(sequence)} segments.")
 
     prepared = []
     durations = []
@@ -452,8 +506,6 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
 
     effects_filter = build_effects_filter(preset, effects)
     raw_video = os.path.join(tmpdir, "raw_video.mp4")
-    if progress_callback:
-        progress_callback("Собираю черновое видео...")
     raw_ok, last_stderr = assemble_raw_video(
         prepared, durations, montage["transition_style"], effects_filter,
         audio_duration, tmpdir, raw_video,
@@ -492,28 +544,21 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
     vis_video = os.path.join(tmpdir, "visualizer.mp4")
     vis_ok = False
     if visualizer["enabled"]:
-        if progress_callback:
-            progress_callback("Генерирую визуализатор...")
         vis_ok = generate_visualizer(audio_path, vis_video, preset, visualizer, width, height, audio_duration)
+        if progress_callback:
+            progress_callback("80% Visualizer generated." if vis_ok else "80% Visualizer unavailable; continuing without it.")
     else:
         logger.info("Visualizer disabled; generation skipped")
         if progress_callback:
-            progress_callback("Визуализатор отключен, пропускаю.")
+            progress_callback("80% Visualizer skipped.")
 
     if progress_callback:
-        progress_callback("Финальный рендер...")
-    if visualizer["position"] == "bottom":
-        overlay_x, overlay_y = "0", "H-h-10"
-    elif visualizer["position"] == "top":
-        overlay_x, overlay_y = "0", "10"
-    else:
-        overlay_x, overlay_y = "(W-w)/2", "H-h-40"
+        progress_callback("90% Final render.")
     if vis_ok and os.path.exists(vis_video):
+        overlay_filter = build_visualizer_overlay_filter(visualizer, width, height)
         final_cmd = [
             "ffmpeg", "-y", "-i", raw_video, "-i", vis_video, "-i", audio_path,
-            "-filter_complex",
-            f"[1:v]scale={width}:{visualizer['height']},format=rgba,colorchannelmixer=aa=0.75[vis];"
-            f"[0:v][vis]overlay={overlay_x}:{overlay_y}[out]",
+            "-filter_complex", overlay_filter,
             "-map", "[out]", "-map", "2:a", "-c:v", "libx264", "-preset", "medium",
             "-crf", "17", "-c:a", "aac", "-b:a", "320k", "-t", str(audio_duration), output_path,
         ]

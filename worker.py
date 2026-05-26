@@ -77,7 +77,6 @@ def run_render_job(job_id: str, payload: dict):
         logger.info("Job %s visualizer_config=%s effects_config=%s", job_id, visualizer_config, effects_config)
 
         jobs[job_id] = "downloading"
-        notify_telegram(bot_token, user_id, "Downloading videos...")
         video_folder_id = extract_drive_id(payload["video_link"], is_folder=True)
         audio_file_id = extract_drive_id(payload["audio_link"], is_folder=False)
         if not video_folder_id or not audio_file_id:
@@ -87,25 +86,24 @@ def run_render_job(job_id: str, payload: dict):
         logger.info("Number of clips downloaded: %d", len(video_clips))
         if not video_clips:
             raise ValueError("В папке нет MP4 файлов")
-        notify_telegram(bot_token, user_id, f"Downloaded {len(video_clips)} clips.")
 
         audio_path = download_audio_file(audio_file_id, tmpdir)
         if not audio_path:
             raise ValueError("Не удалось скачать аудиофайл")
-        notify_telegram(bot_token, user_id, "Downloaded audio.")
+        notify_telegram(bot_token, user_id, f"10% Files downloaded: {len(video_clips)} clips and audio.")
 
         jobs[job_id] = "analyzing"
         clips = []
-        for index, video_path in enumerate(video_clips, start=1):
+        for video_path in video_clips:
             clip_data = analyze_clip(video_path)
             if clip_data:
                 clips.append(clip_data)
             else:
                 logger.warning("Rejected unreadable clip: %s", video_path)
-            notify_telegram(bot_token, user_id, f"Analyzed {index}/{len(video_clips)} clips.")
         logger.info("Number of clips analyzed: %d", len(clips))
         if not clips:
             raise ValueError("Не удалось проанализировать видеоклипы")
+        notify_telegram(bot_token, user_id, f"20% Clips analyzed: {len(clips)} readable clips.")
 
         jobs[job_id] = "rendering"
         output_path = os.path.join(tmpdir, "FINAL_VIDEO.mp4")
@@ -124,12 +122,12 @@ def run_render_job(job_id: str, payload: dict):
         )
 
         jobs[job_id] = "uploading"
-        notify_telegram(bot_token, user_id, "Загружаю готовое видео...")
         download_link = upload_to_gcs(output_path, bucket_name, object_name)
         jobs[job_id] = "done"
         notify_telegram(
             bot_token,
             user_id,
+            "100% Uploaded to Cloud Storage.\n\n"
             "🎉 ВИДЕО ГОТОВО!\n\n"
             f"Duration: {result['duration']}\n"
             f"BPM: {result['bpm']}\n"
