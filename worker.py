@@ -11,7 +11,8 @@ import uuid
 import requests
 from flask import Flask, jsonify, request
 
-from drive_handler import download_audio_file, download_folder_videos, upload_file
+from drive_handler import download_audio_file, download_folder_videos
+from storage_handler import upload_to_gcs
 from video_processor import analyze_clip, build_video
 
 logging.basicConfig(level=logging.INFO)
@@ -54,6 +55,15 @@ def run_render_job(job_id: str, payload: dict):
     bot_token = payload["bot_token"]
     tmpdir = tempfile.mkdtemp()
     try:
+        bucket_name = os.environ.get("OUTPUT_BUCKET_NAME", "")
+        if not bucket_name:
+            raise ValueError(
+                "OUTPUT_BUCKET_NAME is not configured. Final video upload requires Google Cloud Storage."
+            )
+        object_name = f"renders/{job_id}/FINAL_VIDEO.mp4"
+        logger.info("Selected output bucket: %s", bucket_name)
+        logger.info("Selected output object path: %s", object_name)
+
         montage_config = payload.get("montage_config")
         visualizer_config = payload.get("visualizer_config")
         effects_config = payload.get("effects_config")
@@ -114,19 +124,20 @@ def run_render_job(job_id: str, payload: dict):
         )
 
         jobs[job_id] = "uploading"
-        notify_telegram(bot_token, user_id, "Uploading to Drive...")
-        drive_link = upload_file(output_path, video_folder_id)
+        notify_telegram(bot_token, user_id, "Загружаю готовое видео...")
+        download_link = upload_to_gcs(output_path, bucket_name, object_name)
         jobs[job_id] = "done"
         notify_telegram(
             bot_token,
             user_id,
-            "*Done!*\n\n"
+            "🎉 ВИДЕО ГОТОВО!\n\n"
             f"Duration: {result['duration']}\n"
             f"BPM: {result['bpm']}\n"
-            f"Segments: {result['clips_used']}\n"
-            f"Size: {result['file_size_gb']} GB\n\n"
-            f"[Download video]({drive_link})\n\n"
-            "Send /start for another render.",
+            f"Clips used: {result['clips_used']}\n"
+            f"File size: {result['file_size_gb']} GB\n\n"
+            f"Download link:\n{download_link}\n\n"
+            "Отправьте /start для нового видео.",
+            parse_mode=None,
         )
     except Exception as exc:
         logger.error("Job %s failed: %s", job_id, exc, exc_info=True)
