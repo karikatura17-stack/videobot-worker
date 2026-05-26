@@ -34,12 +34,15 @@ def extract_drive_id(url: str, is_folder: bool) -> str:
     return ""
 
 
-def notify_telegram(bot_token: str, user_id: int, text: str):
+def notify_telegram(bot_token: str, user_id: int, text: str, parse_mode: str | None = "Markdown"):
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        message = {"chat_id": user_id, "text": text}
+        if parse_mode:
+            message["parse_mode"] = parse_mode
         requests.post(
             url,
-            json={"chat_id": user_id, "text": text, "parse_mode": "Markdown"},
+            json=message,
             timeout=10,
         )
     except Exception as exc:
@@ -131,7 +134,8 @@ def run_render_job(job_id: str, payload: dict):
         notify_telegram(
             bot_token,
             user_id,
-            f"Ошибка рендера:\n{str(exc)[:300]}\n\nОтправьте /start, чтобы попробовать снова.",
+            f"{str(exc)[:1000]}\n\nОтправьте /start, чтобы попробовать снова.",
+            parse_mode=None,
         )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

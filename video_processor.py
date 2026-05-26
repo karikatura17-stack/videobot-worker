@@ -197,7 +197,7 @@ def detect_beats(audio_path: str) -> tuple:
 def normalize_montage_config(config: dict | None) -> dict:
     merged = {**DEFAULT_MONTAGE_CONFIG, **(config or {})}
     merged["transition_style"] = (
-        merged["transition_style"] if merged["transition_style"] in {"cut", "crossfade", "glitch"} else "cut"
+        merged["transition_style"] if merged["transition_style"] in {"cut", "crossfade"} else "cut"
     )
     merged["beat_cut_mode"] = (
         merged["beat_cut_mode"] if merged["beat_cut_mode"] in {"auto", "4_beats", "8_beats", "16_beats"} else "auto"
@@ -297,6 +297,8 @@ def prepare_clip_variant(clip: dict, tmpdir: str, variant: str, target_duration:
 
 
 def build_effects_filter(preset: dict, effects: dict) -> str:
+    if not any(effects.values()):
+        return "null"
     filters = []
     color_filter_name = preset.get("color_filter")
     if color_filter_name in COLOR_FILTERS:
@@ -357,6 +359,40 @@ def build_crossfade_filter(segment_durations: list, effects_filter: str, transit
     return ";".join(parts), "[outv]"
 
 
+def assemble_raw_video(prepared: list, durations: list, transition_style: str,
+                       effects_filter: str, audio_duration: float, tmpdir: str,
+                       raw_video: str, fallback_name: str | None = None) -> tuple[bool, str]:
+    """Assemble prepared segments and retain stderr for recovery reporting."""
+    logger.info("Raw assembly transition_style=%s", transition_style)
+    logger.info("Raw assembly effects_filter=%s", effects_filter)
+    logger.info("Raw assembly prepared clips=%d", len(prepared))
+    logger.info("Raw assembly first prepared paths=%s", prepared[:3])
+    logger.info("Raw assembly fallback retry=%s", fallback_name or "none")
+
+    if transition_style == "crossfade" and len(prepared) > 1:
+        filter_complex, output_label = build_crossfade_filter(durations, effects_filter, "fade")
+        inputs = [item for path in prepared for item in ("-i", path)]
+        cmd = [
+            "ffmpeg", "-y", *inputs, "-filter_complex", filter_complex, "-map", output_label,
+            "-t", str(audio_duration), "-c:v", "libx264", "-preset", "fast", "-crf", "18", raw_video,
+        ]
+    else:
+        concat_list = os.path.join(tmpdir, f"concat_{fallback_name or 'primary'}.txt")
+        with open(concat_list, "w", encoding="utf-8") as concat_file:
+            for path in prepared:
+                concat_file.write(f"file '{path}'\n")
+        cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list,
+            "-vf", effects_filter, "-t", str(audio_duration),
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18", raw_video,
+        ]
+
+    logger.info("Raw ffmpeg command: %s", " ".join(cmd))
+    result = run_ffmpeg(cmd, f"Raw video ({fallback_name or 'primary'})", 3600)
+    stderr = result.stderr.decode(errors="replace") if result.stderr else ""
+    return result.returncode == 0, stderr
+
+
 def build_video(clips: list, audio_path: str, style: str, user_overrides: dict | None,
                 tmpdir: str, output_path: str, progress_callback=None,
                 montage_config: dict | None = None, visualizer_config: dict | None = None,
@@ -387,7 +423,7 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
     used = set()
     current = random.choice(clips)
     elapsed = 0.0
-    overlap = 0.35 if montage["transition_style"] in {"crossfade", "glitch"} else 0.0
+    overlap = 0.35 if montage["transition_style"] == "crossfade" else 0.0
     while elapsed < audio_duration:
         needed_duration = audio_duration - elapsed + (overlap if sequence else 0.0)
         segment_duration = min(target_duration, max(2.0, needed_duration))
@@ -406,38 +442,52 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
     prepared = []
     durations = []
     for index, clip in enumerate(sequence, start=1):
-        if progress_callback:
-            progress_callback(f"Подготавливаю варианты {index}/{len(sequence)}")
         durations.append(clip["_segment_duration"])
         prepared.append(prepare_clip_variant(
             clip, tmpdir, clip["_variant"], clip["_segment_duration"],
             montage["allow_random_trim"], width, height, index,
         ))
+    if progress_callback:
+        progress_callback("60% Video segments prepared.")
 
     effects_filter = build_effects_filter(preset, effects)
     raw_video = os.path.join(tmpdir, "raw_video.mp4")
     if progress_callback:
         progress_callback("Собираю черновое видео...")
-    if montage["transition_style"] in {"crossfade", "glitch"} and len(prepared) > 1:
-        transition = "fade" if montage["transition_style"] == "crossfade" else "pixelize"
-        filter_complex, output_label = build_crossfade_filter(durations, effects_filter, transition)
-        inputs = [item for path in prepared for item in ("-i", path)]
-        cmd = [
-            "ffmpeg", "-y", *inputs, "-filter_complex", filter_complex, "-map", output_label,
-            "-t", str(audio_duration), "-c:v", "libx264", "-preset", "fast", "-crf", "18", raw_video,
-        ]
-    else:
-        concat_list = os.path.join(tmpdir, "concat.txt")
-        with open(concat_list, "w", encoding="utf-8") as concat_file:
-            for path in prepared:
-                concat_file.write(f"file '{path}'\n")
-        cmd = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list,
-            "-vf", effects_filter, "-t", str(audio_duration),
-            "-c:v", "libx264", "-preset", "fast", "-crf", "18", raw_video,
-        ]
-    if run_ffmpeg(cmd, "Raw video", 3600).returncode != 0:
-        raise RuntimeError("Ошибка сборки видео")
+    raw_ok, last_stderr = assemble_raw_video(
+        prepared, durations, montage["transition_style"], effects_filter,
+        audio_duration, tmpdir, raw_video,
+    )
+    if not raw_ok:
+        raw_ok, last_stderr = assemble_raw_video(
+            prepared, durations, "cut", effects_filter,
+            audio_duration, tmpdir, raw_video, "retry_1_hard_cut_selected_effects",
+        )
+    if not raw_ok:
+        raw_ok, last_stderr = assemble_raw_video(
+            prepared, durations, "cut", "null",
+            audio_duration, tmpdir, raw_video, "retry_2_hard_cut_no_effects",
+        )
+    if not raw_ok:
+        try:
+            fallback_prepared = [
+                prepare_clip_variant(
+                    clip, tmpdir, "normal", clip["_segment_duration"],
+                    False, width, height, index + len(sequence),
+                )
+                for index, clip in enumerate(sequence, start=1)
+            ]
+            raw_ok, last_stderr = assemble_raw_video(
+                fallback_prepared, durations, "cut", "null",
+                audio_duration, tmpdir, raw_video, "retry_3_normal_no_trim",
+            )
+        except Exception as exc:
+            logger.error("Final raw assembly fallback preparation failed: %s", exc, exc_info=True)
+    if not raw_ok:
+        stderr_summary = (last_stderr.strip() or "ffmpeg did not return an error message")[-800:]
+        raise RuntimeError(f"Ошибка сборки видео: {stderr_summary}")
+    if progress_callback:
+        progress_callback("70% Raw video assembled.")
 
     vis_video = os.path.join(tmpdir, "visualizer.mp4")
     vis_ok = False
