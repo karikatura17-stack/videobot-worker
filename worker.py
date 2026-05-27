@@ -67,14 +67,20 @@ def run_render_job(job_id: str, payload: dict):
         montage_config = payload.get("montage_config")
         visualizer_config = payload.get("visualizer_config")
         effects_config = payload.get("effects_config")
+        effects_intensity = payload.get("effects_intensity")
         # Keep compatibility while a previously deployed bot is still sending old fields.
         if visualizer_config is None and "visualizer" in payload:
             visualizer_config = {"enabled": bool(payload["visualizer"])}
         if effects_config is None:
             effects_config = payload.get("overrides")
+        if effects_intensity is None and isinstance(effects_config, dict):
+            effects_intensity = effects_config.get("intensity")
 
         logger.info("Job %s style=%s montage_config=%s", job_id, payload["style"], montage_config)
-        logger.info("Job %s visualizer_config=%s effects_config=%s", job_id, visualizer_config, effects_config)
+        logger.info(
+            "Job %s visualizer_config=%s effects_config=%s effects_intensity=%s",
+            job_id, visualizer_config, effects_config, effects_intensity,
+        )
 
         jobs[job_id] = "downloading"
         video_folder_id = extract_drive_id(payload["video_link"], is_folder=True)
@@ -103,8 +109,6 @@ def run_render_job(job_id: str, payload: dict):
         logger.info("Number of clips analyzed: %d", len(clips))
         if not clips:
             raise ValueError("Не удалось проанализировать видеоклипы")
-        notify_telegram(bot_token, user_id, f"20% Clips analyzed: {len(clips)} readable clips.")
-
         jobs[job_id] = "rendering"
         output_path = os.path.join(tmpdir, "FINAL_VIDEO.mp4")
 
@@ -119,6 +123,7 @@ def run_render_job(job_id: str, payload: dict):
             montage_config=montage_config,
             visualizer_config=visualizer_config,
             effects_config=effects_config,
+            effects_intensity=effects_intensity,
         )
 
         jobs[job_id] = "uploading"

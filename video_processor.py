@@ -46,43 +46,96 @@ VISUALIZER_COLORS = {
 }
 
 VISUALIZER_HEIGHTS = {"small": 60, "medium": 90, "large": 130}
+VISUALIZER_AMPLITUDE = {
+    "soft": {"bars": "lin", "waveform": "lin"},
+    "normal": {"bars": "sqrt", "waveform": "sqrt"},
+    "strong": {"bars": "log", "waveform": "cbrt"},
+}
 
 EFFECTS_REGISTRY = {
     "high_contrast": {
         "title": "High contrast", "emoji": "◐", "category": "Color / Look",
-        "stable": True, "filter": "eq=contrast=1.20",
+        "stable": True,
     },
     "saturation_boost": {
         "title": "Saturation boost", "emoji": "🌈", "category": "Color / Look",
-        "stable": True, "filter": "eq=saturation=1.25",
+        "stable": True,
     },
     "dark_phonk_grade": {
         "title": "Dark phonk grade", "emoji": "🌑", "category": "Color / Look",
-        "stable": True, "filter": LOOK_FILTERS["dark_purple"],
+        "stable": True,
     },
     "cold_neon_grade": {
         "title": "Cold neon grade", "emoji": "🧊", "category": "Color / Look",
-        "stable": True, "filter": LOOK_FILTERS["neon_blue"],
+        "stable": True,
     },
     "warm_gold_grade": {
         "title": "Warm gold grade", "emoji": "🌅", "category": "Color / Look",
-        "stable": True, "filter": LOOK_FILTERS["warm_gold"],
+        "stable": True,
     },
     "film_grain": {
         "title": "Film grain", "emoji": "🎞", "category": "Texture",
-        "stable": True, "filter": "noise=alls=12:allf=t+u",
+        "stable": True,
     },
     "vignette": {
         "title": "Vignette", "emoji": "🌘", "category": "Texture",
-        "stable": True, "filter": "vignette=angle=0.18",
+        "stable": True,
     },
     "scanlines": {
         "title": "Scanlines", "emoji": "▤", "category": "Texture",
-        "stable": True, "filter": "drawgrid=w=iw:h=4:t=1:c=black@0.16",
+        "stable": True,
     },
     "chromatic_aberration": {
         "title": "Chromatic aberration", "emoji": "⚡", "category": "Energy FX",
-        "stable": True, "filter": "rgbashift=rh=3:bh=-3",
+        "stable": True,
+    },
+}
+
+EFFECT_FILTERS = {
+    "high_contrast": {
+        "soft": "eq=contrast=1.10",
+        "normal": "eq=contrast=1.20",
+        "strong": "eq=contrast=1.32",
+    },
+    "saturation_boost": {
+        "soft": "eq=saturation=1.12",
+        "normal": "eq=saturation=1.25",
+        "strong": "eq=saturation=1.42",
+    },
+    "dark_phonk_grade": {
+        "soft": "curves=r='0/0 .5/.43 1/.90':g='0/0 .5/.39 1/.82':b='0/0 .5/.48 1/.94'",
+        "normal": LOOK_FILTERS["dark_purple"],
+        "strong": "curves=r='0/0 .5/.25 1/.70':g='0/0 .5/.18 1/.50':b='0/0 .5/.44 1/.84'",
+    },
+    "cold_neon_grade": {
+        "soft": "curves=r='0/0 .5/.43 1/.86':g='0/0 .5/.48 1/.92':b='0/0 .5/.57 1/1'",
+        "normal": LOOK_FILTERS["neon_blue"],
+        "strong": "curves=r='0/0 .5/.18 1/.56':g='0/0 .5/.29 1/.69':b='0/0 .5/.61 1/1'",
+    },
+    "warm_gold_grade": {
+        "soft": "curves=r='0/0 .5/.56 1/1':g='0/0 .5/.51 1/.94':b='0/0 .5/.42 1/.86'",
+        "normal": LOOK_FILTERS["warm_gold"],
+        "strong": "curves=r='0/0 .5/.61 1/1':g='0/0 .5/.44 1/.82':b='0/0 .5/.17 1/.52'",
+    },
+    "film_grain": {
+        "soft": "noise=alls=6:allf=t+u",
+        "normal": "noise=alls=12:allf=t+u",
+        "strong": "noise=alls=19:allf=t+u",
+    },
+    "vignette": {
+        "soft": "vignette=angle=0.10",
+        "normal": "vignette=angle=0.18",
+        "strong": "vignette=angle=0.27",
+    },
+    "scanlines": {
+        "soft": "drawgrid=w=iw:h=4:t=1:c=black@0.08",
+        "normal": "drawgrid=w=iw:h=4:t=1:c=black@0.16",
+        "strong": "drawgrid=w=iw:h=4:t=1:c=black@0.25",
+    },
+    "chromatic_aberration": {
+        "soft": "rgbashift=rh=1:bh=-1",
+        "normal": "rgbashift=rh=3:bh=-3",
+        "strong": "rgbashift=rh=5:bh=-5",
     },
 }
 
@@ -242,6 +295,7 @@ def normalize_visualizer_config(config: dict | None, preset: dict) -> dict:
         "background_opacity": config.get("background_opacity", "none"),
         "color": config.get("color", preset["visualizer_color"]),
         "glow": config.get("glow", "soft"),
+        "intensity": config.get("intensity", "normal"),
     }
     if result["type"] not in {"bars", "waveform"}:
         result["type"] = preset["visualizer_type"]
@@ -257,16 +311,30 @@ def normalize_visualizer_config(config: dict | None, preset: dict) -> dict:
         result["color"] = preset["visualizer_color"]
     if result["glow"] not in {"off", "soft", "strong"}:
         result["glow"] = "soft"
+    if result["intensity"] not in VISUALIZER_AMPLITUDE:
+        result["intensity"] = "normal"
     result["height"] = VISUALIZER_HEIGHTS[result["size"]]
     return result
 
 
 def normalize_effects_config(config: dict | None, preset: dict) -> dict:
     config = config or {}
-    ignored = sorted(key for key, value in config.items() if value and key not in EFFECTS_REGISTRY)
+    if isinstance(config.get("selected"), list):
+        selected = set(config["selected"])
+        ignored = sorted(selected - set(EFFECTS_REGISTRY))
+        config = {key: key in selected for key in EFFECTS_REGISTRY}
+    else:
+        ignored = sorted(
+            key for key, value in config.items()
+            if value and key not in EFFECTS_REGISTRY and key != "intensity"
+        )
     if ignored:
         logger.warning("Unsupported effects ignored: %s", ", ".join(ignored))
     return {key: bool(config.get(key, False)) for key in EFFECTS_REGISTRY}
+
+
+def normalize_intensity(value: str | None) -> str:
+    return value if value in {"soft", "normal", "strong"} else "normal"
 
 
 def segment_duration_for_mode(bpm: float, mode: str, style: str) -> float:
@@ -329,11 +397,11 @@ def prepare_clip_variant(clip: dict, tmpdir: str, variant: str, target_duration:
     return out
 
 
-def build_effects_filter(preset: dict, effects: dict) -> str:
+def build_effects_filter(preset: dict, effects: dict, intensity: str = "normal") -> str:
     if not any(effects.values()):
         return "null"
     filters = [
-        details["filter"]
+        EFFECT_FILTERS[effect_id][intensity]
         for effect_id, details in EFFECTS_REGISTRY.items()
         if effects.get(effect_id) and details["stable"]
     ]
@@ -345,13 +413,14 @@ def generate_visualizer(audio_path: str, output_path: str, preset: dict, config:
     vis_type = config["type"]
     vis_h = config["height"]
     color = VISUALIZER_COLORS[config["color"]]
+    amplitude_scale = VISUALIZER_AMPLITUDE[config["intensity"]][vis_type]
     if vis_type == "bars":
         vis_filter = (
-            f"showfreqs=s={width}x{vis_h}:win_size=1024:ascale=sqrt:"
+            f"showfreqs=s={width}x{vis_h}:win_size=1024:ascale={amplitude_scale}:"
             f"fscale=log:colors=0x{color}|0x{color}:mode=bar:cmode=combined"
         )
     else:
-        vis_filter = f"showwaves=s={width}x{vis_h}:mode=cline:colors=0x{color}:scale=sqrt"
+        vis_filter = f"showwaves=s={width}x{vis_h}:mode=cline:colors=0x{color}:scale={amplitude_scale}"
     cmd = [
         "ffmpeg", "-y", "-i", audio_path, "-filter_complex", f"[0:a]{vis_filter}[vis]",
         "-map", "[vis]", "-c:v", "libx264", "-preset", "fast", "-crf", "20",
@@ -452,14 +521,17 @@ def assemble_raw_video(prepared: list, durations: list, transition_style: str,
 def build_video(clips: list, audio_path: str, style: str, user_overrides: dict | None,
                 tmpdir: str, output_path: str, progress_callback=None,
                 montage_config: dict | None = None, visualizer_config: dict | None = None,
-                effects_config: dict | None = None) -> dict:
+                effects_config: dict | None = None, effects_intensity: str | None = None) -> dict:
     preset = STYLE_PRESETS.get(style, STYLE_PRESETS["phonk"])
     montage = normalize_montage_config(montage_config)
     visualizer = normalize_visualizer_config(visualizer_config, preset)
+    if effects_intensity is None and isinstance(effects_config, dict):
+        effects_intensity = effects_config.get("intensity")
+    effects_intensity = normalize_intensity(effects_intensity)
     effects = normalize_effects_config(effects_config if effects_config is not None else user_overrides, preset)
     logger.info("Selected montage_config: %s", montage)
     logger.info("Selected visualizer_config: %s", visualizer)
-    logger.info("Selected effects_config: %s", effects)
+    logger.info("Selected effects_config: %s intensity=%s", effects, effects_intensity)
 
     clips = [clip for clip in clips if clip]
     if not clips:
@@ -490,9 +562,6 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
         current = selected
         elapsed += segment_duration - (overlap if len(sequence) > 1 else 0.0)
     logger.info("Final sequence length: %d segments, target duration %.3fs", len(sequence), target_duration)
-    if progress_callback:
-        progress_callback(f"45% Montage plan built: {len(sequence)} segments.")
-
     prepared = []
     durations = []
     for index, clip in enumerate(sequence, start=1):
@@ -504,7 +573,7 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
     if progress_callback:
         progress_callback("60% Video segments prepared.")
 
-    effects_filter = build_effects_filter(preset, effects)
+    effects_filter = build_effects_filter(preset, effects, effects_intensity)
     raw_video = os.path.join(tmpdir, "raw_video.mp4")
     raw_ok, last_stderr = assemble_raw_video(
         prepared, durations, montage["transition_style"], effects_filter,
@@ -538,9 +607,6 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
     if not raw_ok:
         stderr_summary = (last_stderr.strip() or "ffmpeg did not return an error message")[-800:]
         raise RuntimeError(f"Ошибка сборки видео: {stderr_summary}")
-    if progress_callback:
-        progress_callback("70% Raw video assembled.")
-
     vis_video = os.path.join(tmpdir, "visualizer.mp4")
     vis_ok = False
     if visualizer["enabled"]:
