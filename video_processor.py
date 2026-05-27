@@ -147,6 +147,9 @@ DEFAULT_MONTAGE_CONFIG = {
     "transition_style": "cut",
     "beat_cut_mode": "auto",
     "clip_order_mode": "visual_match",
+    "speed_accents_mode": "off",
+    "speed_accents_amount": 0.20,
+    "speed_accents_speed": 1.25,
 }
 
 
@@ -233,12 +236,25 @@ def color_distance(c1: list, c2: list) -> float:
     return float(np.sqrt(sum((a - b) ** 2 for a, b in zip(c1, c2))))
 
 
+def similarity_penalty(current_clip: dict, next_clip: dict) -> float:
+    """Discourage adjacent shots that are technically compatible but nearly identical."""
+    color_change = color_distance(current_clip["last_color"], next_clip["first_color"])
+    brightness_change = abs(current_clip.get("brightness", 0) - next_clip.get("brightness", 0))
+    motion_change = abs(current_clip.get("motion", 0) - next_clip.get("motion", 0))
+    if color_change < 12 and brightness_change < 6 and motion_change < 2.5:
+        return 28.0
+    if color_change < 20 and brightness_change < 10 and motion_change < 4:
+        return 12.0
+    return 0.0
+
+
 def compatibility_score(current_clip: dict, next_clip: dict, target_energy: float | None = None) -> float:
     """Return a soft transition cost; lower values are more visually compatible."""
     score = color_distance(current_clip["last_color"], next_clip["first_color"])
     score += abs(current_clip.get("brightness", 0) - next_clip.get("brightness", 0)) * 0.35
     score += abs(current_clip.get("saturation", 0) - next_clip.get("saturation", 0)) * 0.18
     score += abs(current_clip.get("motion", 0) - next_clip.get("motion", 0)) * 0.8
+    score += similarity_penalty(current_clip, next_clip)
     if target_energy is not None:
         score += abs(next_clip.get("visual_energy", 0) - target_energy) * 0.15
     score -= next_clip.get("quality", 0) * 0.04
@@ -246,16 +262,32 @@ def compatibility_score(current_clip: dict, next_clip: dict, target_energy: floa
     return score
 
 
-def choose_next_clip(current: dict, candidates: list, used: set, mode: str, target_energy=None) -> dict:
-    available = [clip for clip in candidates if clip["path"] not in used] or candidates
+def choose_next_clip(current: dict, candidates: list, recent_paths: list, usage_counts: dict,
+                     mode: str, target_energy=None) -> dict:
+    if len(candidates) == 1:
+        return candidates[0]
+
+    cooldown_size = min(4, max(2, len(candidates) - 1)) if len(candidates) >= 3 else 1
+    cooling_down = set(recent_paths[-cooldown_size:])
+    available = [clip for clip in candidates if clip["path"] not in cooling_down]
+    if not available:
+        available = [clip for clip in candidates if clip["path"] != current["path"]] or candidates
+    visually_varied = [clip for clip in available if similarity_penalty(current, clip) == 0]
+    if visually_varied:
+        available = visually_varied
+
     if mode == "random":
-        return random.choice(available)
+        least_used = min(usage_counts.get(clip["path"], 0) for clip in available)
+        return random.choice([clip for clip in available if usage_counts.get(clip["path"], 0) <= least_used + 1])
     if mode == "quality_weighted":
-        weights = [max(1, clip.get("quality", 0) + 10) for clip in available]
+        weights = [
+            max(1, clip.get("quality", 0) + 10) / (1 + usage_counts.get(clip["path"], 0) * 0.35)
+            for clip in available
+        ]
         return random.choices(available, weights=weights, k=1)[0]
     ranked = sorted(
         available,
-        key=lambda clip: compatibility_score(current, clip, target_energy),
+        key=lambda clip: compatibility_score(current, clip, target_energy) + usage_counts.get(clip["path"], 0) * 2.5,
     )
     shortlist = ranked[: min(3, len(ranked))]
     return random.choice(shortlist)
@@ -280,6 +312,21 @@ def normalize_montage_config(config: dict | None) -> dict:
     merged["clip_order_mode"] = (
         merged["clip_order_mode"] if merged["clip_order_mode"] in {"visual_match", "random", "quality_weighted"} else "visual_match"
     )
+    merged["speed_accents_mode"] = (
+        merged["speed_accents_mode"] if merged["speed_accents_mode"] in {"off", "auto", "manual"} else "off"
+    )
+    try:
+        merged["speed_accents_amount"] = float(merged["speed_accents_amount"])
+    except (TypeError, ValueError):
+        merged["speed_accents_amount"] = 0.20
+    if merged["speed_accents_amount"] not in {0.10, 0.20, 0.30}:
+        merged["speed_accents_amount"] = 0.20
+    try:
+        merged["speed_accents_speed"] = float(merged["speed_accents_speed"])
+    except (TypeError, ValueError):
+        merged["speed_accents_speed"] = 1.25
+    if merged["speed_accents_speed"] not in {1.15, 1.25, 1.35, 1.50}:
+        merged["speed_accents_speed"] = 1.25
     for option in ("allow_mirror", "allow_reverse", "allow_mirror_reverse", "allow_random_trim"):
         merged[option] = bool(merged[option])
     return merged
@@ -346,6 +393,51 @@ def segment_duration_for_mode(bpm: float, mode: str, style: str) -> float:
     return max(2.0, beat_duration * beat_count)
 
 
+def resolve_speed_accents(config: dict, bpm: float, style: str) -> tuple[float, float]:
+    mode = config["speed_accents_mode"]
+    if mode == "off":
+        return 0.0, 1.0
+    if mode == "manual":
+        return config["speed_accents_amount"], config["speed_accents_speed"]
+    if style == "phonk" and bpm >= 125:
+        return 0.30, 1.35
+    if style == "house" or bpm < 105:
+        return 0.10, 1.15
+    if style == "phonk" or bpm >= 120:
+        return 0.20, 1.25
+    return 0.20, 1.25
+
+
+def apply_speed_accents(sequence: list, config: dict, bpm: float, style: str) -> tuple[float, float]:
+    amount, speed = resolve_speed_accents(config, bpm, style)
+    for clip in sequence:
+        clip["_speed"] = 1.0
+    if amount <= 0 or speed <= 1.0:
+        logger.info("Speed accents disabled")
+        return amount, speed
+
+    eligible = [
+        index for index, clip in enumerate(sequence)
+        if clip["duration"] + 0.001 >= clip["_segment_duration"] * speed
+    ]
+    random.shuffle(eligible)
+    desired_count = max(1, round(len(sequence) * amount))
+    selected = []
+    for index in eligible:
+        if any(abs(index - chosen) <= 1 for chosen in selected):
+            continue
+        selected.append(index)
+        if len(selected) >= desired_count:
+            break
+    for index in selected:
+        sequence[index]["_speed"] = speed
+    logger.info(
+        "Speed accents mode=%s resolved_amount=%.2f resolved_speed=%.2f eligible=%d applied=%s",
+        config["speed_accents_mode"], amount, speed, len(eligible), selected,
+    )
+    return amount, speed
+
+
 def allowed_variants(config: dict) -> list:
     variants = ["normal"]
     if config["allow_mirror"]:
@@ -366,14 +458,23 @@ def run_ffmpeg(cmd: list, task: str, timeout: int):
 
 
 def prepare_clip_variant(clip: dict, tmpdir: str, variant: str, target_duration: float,
-                         random_trim: bool, width: int, height: int, index: int) -> str:
+                         random_trim: bool, width: int, height: int, index: int,
+                         speed: float = 1.0) -> str:
     src = clip["path"]
     out = os.path.join(tmpdir, f"variant_{index:04d}_{variant}.mp4")
-    available_start = max(0.0, clip["duration"] - target_duration)
+    source_duration = target_duration * speed
+    if speed > 1.0 and clip["duration"] + 0.001 < source_duration:
+        logger.info(
+            "Speed accent skipped for segment %d path=%s: source %.3fs < required %.3fs",
+            index, src, clip["duration"], source_duration,
+        )
+        speed = 1.0
+        source_duration = target_duration
+    available_start = max(0.0, clip["duration"] - source_duration)
     start = random.uniform(0, available_start) if random_trim and available_start > 0.25 else 0.0
     filters = [
-        f"trim=start={start:.3f}:duration={target_duration:.3f}",
-        "setpts=PTS-STARTPTS",
+        f"trim=start={start:.3f}:duration={source_duration:.3f}",
+        f"setpts=(PTS-STARTPTS)/{speed:.2f}" if speed > 1.0 else "setpts=PTS-STARTPTS",
     ]
     if "mirror" in variant:
         filters.append("hflip")
@@ -546,7 +647,8 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
     width, height = clips[0]["width"], clips[0]["height"]
     target_energy = float(np.mean([clip.get("visual_energy", 0) for clip in clips]))
     sequence = []
-    used = set()
+    recent_paths = []
+    usage_counts = {clip["path"]: 0 for clip in clips}
     current = random.choice(clips)
     elapsed = 0.0
     overlap = 0.35 if montage["transition_style"] == "crossfade" else 0.0
@@ -554,21 +656,28 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
         needed_duration = audio_duration - elapsed + (overlap if sequence else 0.0)
         segment_duration = min(target_duration, max(2.0, needed_duration))
         selected = current if not sequence else choose_next_clip(
-            current, clips, used, montage["clip_order_mode"], target_energy
+            current, clips, recent_paths, usage_counts, montage["clip_order_mode"], target_energy
         )
         selected = {**selected, "_segment_duration": segment_duration, "_variant": random.choice(allowed_variants(montage))}
         sequence.append(selected)
-        used.add(selected["path"])
+        recent_paths.append(selected["path"])
+        usage_counts[selected["path"]] = usage_counts.get(selected["path"], 0) + 1
+        logger.info(
+            "Segment %d source=%s variant=%s duration=%.3f recent_sources=%s",
+            len(sequence), selected["path"], selected["_variant"], segment_duration, recent_paths[-4:],
+        )
         current = selected
         elapsed += segment_duration - (overlap if len(sequence) > 1 else 0.0)
     logger.info("Final sequence length: %d segments, target duration %.3fs", len(sequence), target_duration)
+    apply_speed_accents(sequence, montage, bpm, style)
     prepared = []
     durations = []
     for index, clip in enumerate(sequence, start=1):
         durations.append(clip["_segment_duration"])
+        logger.info("Preparing segment %d source=%s speed=%.2fx", index, clip["path"], clip["_speed"])
         prepared.append(prepare_clip_variant(
             clip, tmpdir, clip["_variant"], clip["_segment_duration"],
-            montage["allow_random_trim"], width, height, index,
+            montage["allow_random_trim"], width, height, index, clip["_speed"],
         ))
     if progress_callback:
         progress_callback("60% Video segments prepared.")
