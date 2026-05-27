@@ -13,19 +13,19 @@ logger = logging.getLogger(__name__)
 
 STYLE_PRESETS = {
     "phonk": {
-        "visualizer_type": "bars",
+        "visualizer_type": "waveform",
         "visualizer_position": "bottom_overlay",
-        "visualizer_color": "purple",
+        "visualizer_color": "white",
     },
     "japanese": {
         "visualizer_type": "waveform",
-        "visualizer_position": "top_overlay",
-        "visualizer_color": "red",
+        "visualizer_position": "bottom_overlay",
+        "visualizer_color": "white",
     },
     "house": {
-        "visualizer_type": "bars",
-        "visualizer_position": "center_bottom",
-        "visualizer_color": "gold",
+        "visualizer_type": "waveform",
+        "visualizer_position": "bottom_overlay",
+        "visualizer_color": "white",
     },
 }
 
@@ -46,6 +46,14 @@ VISUALIZER_COLORS = {
 }
 
 VISUALIZER_HEIGHTS = {"small": 60, "medium": 90, "large": 130}
+VISUALIZER_TYPES = {
+    "bars": "bars",
+    "waveform": "waveform",
+    "minimal_corner_bars": "bars",
+    "label_bars": "bars",
+    "thin_waveform": "waveform",
+    "compact_waveform": "waveform",
+}
 VISUALIZER_AMPLITUDE = {
     "soft": {"bars": "lin", "waveform": "lin"},
     "normal": {"bars": "sqrt", "waveform": "sqrt"},
@@ -344,7 +352,7 @@ def normalize_visualizer_config(config: dict | None, preset: dict) -> dict:
         "glow": config.get("glow", "soft"),
         "intensity": config.get("intensity", "normal"),
     }
-    if result["type"] not in {"bars", "waveform"}:
+    if result["type"] not in VISUALIZER_TYPES:
         result["type"] = preset["visualizer_type"]
     legacy_positions = {"bottom": "bottom_overlay", "top": "top_overlay"}
     result["position"] = legacy_positions.get(result["position"], result["position"])
@@ -509,19 +517,64 @@ def build_effects_filter(preset: dict, effects: dict, intensity: str = "normal")
     return ",".join(filters) if filters else "null"
 
 
+def visualizer_layout(config: dict, width: int, height: int) -> dict:
+    """Resolve polished overlay dimensions while retaining legacy full-width presets."""
+    vis_type = config["type"]
+    margin_x = max(20, round(width * 0.035))
+    margin_y = max(20, round(height * 0.045))
+    vis_h = config["height"]
+    layout = {"render_width": width, "height": vis_h, "x": 0, "label": False}
+
+    if vis_type == "minimal_corner_bars":
+        layout.update(render_width=max(180, round(width * 0.30)), height=max(42, round(vis_h * 0.70)), x=margin_x)
+    elif vis_type == "label_bars":
+        icon_size = max(42, round(vis_h * 0.72))
+        layout.update(
+            render_width=max(170, round(width * 0.25)),
+            height=icon_size,
+            x=margin_x + icon_size + 12,
+            label=True,
+            icon_size=icon_size,
+            panel_x=margin_x,
+        )
+    elif vis_type == "thin_waveform":
+        render_width=max(360, round(width * 0.68))
+        layout.update(render_width=render_width, height=max(24, round(vis_h * 0.38)), x=(width - render_width) // 2)
+    elif vis_type == "compact_waveform":
+        layout.update(render_width=max(260, round(width * 0.44)), height=max(32, round(vis_h * 0.55)), x=margin_x)
+
+    vis_h = layout["height"]
+    if vis_type in {"minimal_corner_bars", "label_bars", "compact_waveform"}:
+        overlay_y = max(0, height - vis_h - margin_y)
+    elif config["position"] == "top_overlay":
+        overlay_y = 18
+    elif config["position"] == "center_bottom":
+        overlay_y = max(0, height - vis_h - 60)
+    elif config["position"] == "embedded_strip":
+        overlay_y = max(0, height - vis_h)
+    else:
+        overlay_y = max(0, height - vis_h - 18)
+    layout["y"] = overlay_y
+    return layout
+
+
 def generate_visualizer(audio_path: str, output_path: str, preset: dict, config: dict,
                         width: int, height: int, duration: float) -> bool:
     vis_type = config["type"]
-    vis_h = config["height"]
+    base_type = VISUALIZER_TYPES[vis_type]
+    layout = visualizer_layout(config, width, height)
+    vis_width = layout["render_width"]
+    vis_h = layout["height"]
     color = VISUALIZER_COLORS[config["color"]]
-    amplitude_scale = VISUALIZER_AMPLITUDE[config["intensity"]][vis_type]
-    if vis_type == "bars":
+    amplitude_scale = VISUALIZER_AMPLITUDE[config["intensity"]][base_type]
+    if base_type == "bars":
         vis_filter = (
-            f"showfreqs=s={width}x{vis_h}:win_size=1024:ascale={amplitude_scale}:"
+            f"showfreqs=s={vis_width}x{vis_h}:win_size=1024:ascale={amplitude_scale}:"
             f"fscale=log:colors=0x{color}|0x{color}:mode=bar:cmode=combined"
         )
     else:
-        vis_filter = f"showwaves=s={width}x{vis_h}:mode=cline:colors=0x{color}:scale={amplitude_scale}"
+        vis_filter = f"showwaves=s={vis_width}x{vis_h}:mode=cline:colors=0x{color}:scale={amplitude_scale}"
+    logger.info("Selected visualizer preset=%s filter=%s", vis_type, vis_filter)
     cmd = [
         "ffmpeg", "-y", "-i", audio_path, "-filter_complex", f"[0:a]{vis_filter}[vis]",
         "-map", "[vis]", "-c:v", "libx264", "-preset", "fast", "-crf", "20",
@@ -532,41 +585,55 @@ def generate_visualizer(audio_path: str, output_path: str, preset: dict, config:
 
 def build_visualizer_overlay_filter(config: dict, width: int, height: int) -> str:
     """Create a transparent full-frame overlay chain for a generated visualizer."""
-    vis_h = config["height"]
-    if config["position"] == "top_overlay":
-        overlay_y = 18
-    elif config["position"] == "center_bottom":
-        overlay_y = max(0, height - vis_h - 60)
-    elif config["position"] == "embedded_strip":
-        overlay_y = max(0, height - vis_h)
-    else:
-        overlay_y = max(0, height - vis_h - 18)
+    layout = visualizer_layout(config, width, height)
+    vis_h = layout["height"]
+    vis_width = layout["render_width"]
+    overlay_x = layout["x"]
+    overlay_y = layout["y"]
 
     if config["position"] == "embedded_strip":
         alpha = {"none": 0.45, "soft": 0.65, "medium": 0.85}[config["background_opacity"]]
-        box_y, box_h = overlay_y, vis_h
+        box_x, box_y, box_w, box_h = 0, overlay_y, width, vis_h
     else:
         alpha = {"none": 0.0, "soft": 0.18, "medium": 0.34}[config["background_opacity"]]
-        box_y, box_h = max(0, overlay_y - 6), min(height, vis_h + 12)
+        box_x = max(0, overlay_x - 8)
+        box_y = max(0, overlay_y - 6)
+        box_w = min(width - box_x, vis_width + 16)
+        box_h = min(height - box_y, vis_h + 12)
+        if layout["label"]:
+            box_x = layout["panel_x"] - 8
+            box_w = min(width - box_x, vis_width + layout["icon_size"] + 28)
 
     parts = []
     if alpha:
         parts.append(
-            f"[0:v]drawbox=x=0:y={box_y}:w=iw:h={box_h}:color=black@{alpha:.2f}:t=fill[base]"
+            f"[0:v]drawbox=x={box_x}:y={box_y}:w={box_w}:h={box_h}:color=black@{alpha:.2f}:t=fill[base]"
         )
     else:
         parts.append("[0:v]null[base]")
+    if layout["label"]:
+        icon_alpha = 0.65 if config["background_opacity"] == "none" else 0.32
+        icon_thickness = "2" if config["background_opacity"] == "none" else "fill"
+        parts.append(
+            f"[base]drawbox=x={layout['panel_x']}:y={overlay_y}:w={layout['icon_size']}:h={layout['icon_size']}:"
+            f"color=0x{VISUALIZER_COLORS[config['color']]}@{icon_alpha:.2f}:t={icon_thickness}[labelbase]"
+        )
+        base_label = "[labelbase]"
+    else:
+        base_label = "[base]"
     parts.append("[1:v]format=rgba,colorkey=0x000000:0.18:0.06[vis]")
 
     if config["glow"] == "off":
-        parts.append(f"[base][vis]overlay=0:{overlay_y}[out]")
+        parts.append(f"{base_label}[vis]overlay={overlay_x}:{overlay_y}[out]")
     else:
         sigma, glow_alpha = (5, 0.45) if config["glow"] == "soft" else (10, 0.65)
         parts.append("[vis]split[vmain][vglow]")
         parts.append(f"[vglow]gblur=sigma={sigma},colorchannelmixer=aa={glow_alpha:.2f}[glow]")
-        parts.append(f"[base][glow]overlay=0:{overlay_y}[withglow]")
-        parts.append(f"[withglow][vmain]overlay=0:{overlay_y}[out]")
-    return ";".join(parts)
+        parts.append(f"{base_label}[glow]overlay={overlay_x}:{overlay_y}[withglow]")
+        parts.append(f"[withglow][vmain]overlay={overlay_x}:{overlay_y}[out]")
+    overlay_filter = ";".join(parts)
+    logger.info("Selected visualizer preset=%s overlay_filter=%s", config["type"], overlay_filter)
+    return overlay_filter
 
 
 def build_crossfade_filter(segment_durations: list, effects_filter: str, transition: str) -> tuple[str, str]:
