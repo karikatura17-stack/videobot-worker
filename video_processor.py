@@ -354,10 +354,14 @@ def normalize_visualizer_config(config: dict | None, preset: dict) -> dict:
     }
     if result["type"] not in VISUALIZER_TYPES:
         result["type"] = preset["visualizer_type"]
-    legacy_positions = {"bottom": "bottom_overlay", "top": "top_overlay"}
+    legacy_positions = {"bottom_overlay": "bottom", "top_overlay": "top", "center_bottom": "bottom"}
     result["position"] = legacy_positions.get(result["position"], result["position"])
-    if result["position"] not in {"bottom_overlay", "top_overlay", "center_bottom", "embedded_strip"}:
-        result["position"] = preset["visualizer_position"]
+    allowed_positions = (
+        {"bottom", "top"} if result["type"] in {"bars", "waveform", "thin_waveform"}
+        else {"bottom_left", "bottom_right", "top_left", "top_right"}
+    )
+    if result["position"] not in allowed_positions:
+        result["position"] = "bottom" if result["type"] in {"bars", "waveform", "thin_waveform"} else "bottom_left"
     if result["size"] not in VISUALIZER_HEIGHTS:
         result["size"] = "medium"
     if result["background_opacity"] not in {"none", "soft", "medium"}:
@@ -545,13 +549,16 @@ def visualizer_layout(config: dict, width: int, height: int) -> dict:
 
     vis_h = layout["height"]
     if vis_type in {"minimal_corner_bars", "label_bars", "compact_waveform"}:
-        overlay_y = max(0, height - vis_h - margin_y)
-    elif config["position"] == "top_overlay":
+        content_width = layout["render_width"] + (layout.get("icon_size", 0) + 12 if layout["label"] else 0)
+        left_x = margin_x + (layout.get("icon_size", 0) + 12 if layout["label"] else 0)
+        right_x = max(margin_x, width - margin_x - layout["render_width"])
+        if layout["label"]:
+            right_x = max(margin_x, width - margin_x - content_width + layout["icon_size"] + 12)
+            layout["panel_x"] = max(margin_x, width - margin_x - content_width) if config["position"].endswith("right") else margin_x
+        layout["x"] = right_x if config["position"].endswith("right") else left_x
+        overlay_y = margin_y if config["position"].startswith("top") else max(0, height - vis_h - margin_y)
+    elif config["position"] == "top":
         overlay_y = 18
-    elif config["position"] == "center_bottom":
-        overlay_y = max(0, height - vis_h - 60)
-    elif config["position"] == "embedded_strip":
-        overlay_y = max(0, height - vis_h)
     else:
         overlay_y = max(0, height - vis_h - 18)
     layout["y"] = overlay_y
@@ -591,18 +598,14 @@ def build_visualizer_overlay_filter(config: dict, width: int, height: int) -> st
     overlay_x = layout["x"]
     overlay_y = layout["y"]
 
-    if config["position"] == "embedded_strip":
-        alpha = {"none": 0.45, "soft": 0.65, "medium": 0.85}[config["background_opacity"]]
-        box_x, box_y, box_w, box_h = 0, overlay_y, width, vis_h
-    else:
-        alpha = {"none": 0.0, "soft": 0.18, "medium": 0.34}[config["background_opacity"]]
-        box_x = max(0, overlay_x - 8)
-        box_y = max(0, overlay_y - 6)
-        box_w = min(width - box_x, vis_width + 16)
-        box_h = min(height - box_y, vis_h + 12)
-        if layout["label"]:
-            box_x = layout["panel_x"] - 8
-            box_w = min(width - box_x, vis_width + layout["icon_size"] + 28)
+    alpha = {"none": 0.0, "soft": 0.18, "medium": 0.34}[config["background_opacity"]]
+    box_x = max(0, overlay_x - 8)
+    box_y = max(0, overlay_y - 6)
+    box_w = min(width - box_x, vis_width + 16)
+    box_h = min(height - box_y, vis_h + 12)
+    if layout["label"]:
+        box_x = layout["panel_x"] - 8
+        box_w = min(width - box_x, vis_width + layout["icon_size"] + 28)
 
     parts = []
     if alpha:
