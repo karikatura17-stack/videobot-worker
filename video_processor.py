@@ -4,12 +4,17 @@ import logging
 import os
 import random
 import subprocess
+import time
 
 import cv2
 import librosa
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+class RenderCanceled(RuntimeError):
+    pass
 
 STYLE_PRESETS = {
     "phonk": {
@@ -315,7 +320,7 @@ def normalize_montage_config(config: dict | None) -> dict:
         merged["transition_style"] if merged["transition_style"] in {"cut", "crossfade"} else "cut"
     )
     merged["beat_cut_mode"] = (
-        merged["beat_cut_mode"] if merged["beat_cut_mode"] in {"auto", "4_beats", "8_beats", "16_beats"} else "auto"
+        merged["beat_cut_mode"] if merged["beat_cut_mode"] in {"auto", "4_beats", "8_beats", "12_beats", "16_beats"} else "auto"
     )
     merged["clip_order_mode"] = (
         merged["clip_order_mode"] if merged["clip_order_mode"] in {"visual_match", "random", "quality_weighted"} else "visual_match"
@@ -396,12 +401,14 @@ def normalize_intensity(value: str | None) -> str:
     return value if value in {"soft", "normal", "strong"} else "normal"
 
 
-def segment_duration_for_mode(bpm: float, mode: str, style: str) -> float:
+def choose_segment_beat_count(mode: str, style: str, bpm: float) -> int:
+    if mode != "auto":
+        return int(mode.split("_")[0])
+    return random.choices([12, 8, 4], weights=[60, 30, 10], k=1)[0]
+
+
+def segment_duration_for_beat_count(bpm: float, beat_count: int) -> float:
     beat_duration = 60.0 / bpm if bpm > 0 else 0.5
-    if mode == "auto":
-        beat_count = random.choice((4, 8)) if style == "phonk" else (4 if style == "japanese" else random.choice((8, 16)))
-    else:
-        beat_count = int(mode.split("_")[0])
     return max(2.0, beat_duration * beat_count)
 
 
@@ -461,17 +468,80 @@ def allowed_variants(config: dict) -> list:
     return variants
 
 
-def run_ffmpeg(cmd: list, task: str, timeout: int):
-    result = subprocess.run(cmd, capture_output=True, timeout=timeout)
+def with_ffmpeg_nostdin(cmd: list) -> list:
+    if cmd and cmd[0] == "ffmpeg" and "-nostdin" not in cmd:
+        return ["ffmpeg", "-nostdin", *cmd[1:]]
+    return cmd
+
+
+def dir_size_bytes(path: str) -> int:
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def remove_files(paths: list[str]) -> None:
+    for path in paths:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("Could not remove temp file %s: %s", path, exc)
+
+
+def run_ffmpeg(cmd: list, task: str, timeout: int, cancel_check=None):
+    cmd = with_ffmpeg_nostdin(cmd)
+    logger.info("%s ffmpeg start: %s", task, " ".join(cmd))
+    start_time = time.time()
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        while True:
+            if cancel_check and cancel_check():
+                logger.warning("%s canceled; terminating ffmpeg pid=%s", task, proc.pid)
+                proc.terminate()
+                try:
+                    proc.communicate(timeout=8)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
+                raise RenderCanceled("Render canceled")
+            if proc.poll() is not None:
+                _, stderr = proc.communicate()
+                result = subprocess.CompletedProcess(cmd, proc.returncode, stderr=(stderr or b"")[-2000:])
+                break
+            if time.time() - start_time > timeout:
+                logger.error("%s timed out after %ss; terminating ffmpeg pid=%s", task, timeout, proc.pid)
+                proc.terminate()
+                try:
+                    _, stderr = proc.communicate(timeout=8)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    _, stderr = proc.communicate()
+                result = subprocess.CompletedProcess(cmd, 124, stderr=(stderr or b"")[-2000:])
+                break
+            time.sleep(2)
+    except RenderCanceled:
+        raise
+    except Exception as exc:
+        logger.exception("%s ffmpeg process failed: %s", task, exc)
+        return subprocess.CompletedProcess(cmd, 1, stderr=str(exc).encode())
     if result.returncode != 0:
         stderr = result.stderr.decode(errors="replace")[-1500:]
         logger.error("%s ffmpeg command failed: %s\nstderr: %s", task, " ".join(cmd), stderr)
+    else:
+        logger.info("%s ffmpeg completed in %.1fs", task, time.time() - start_time)
     return result
 
 
 def prepare_clip_variant(clip: dict, tmpdir: str, variant: str, target_duration: float,
                          random_trim: bool, width: int, height: int, index: int,
-                         speed: float = 1.0) -> str:
+                         speed: float = 1.0, cancel_check=None) -> str:
     src = clip["path"]
     out = os.path.join(tmpdir, f"variant_{index:04d}_{variant}.mp4")
     source_duration = target_duration * speed
@@ -504,9 +574,10 @@ def prepare_clip_variant(clip: dict, tmpdir: str, variant: str, target_duration:
         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
         "-t", f"{target_duration:.3f}", out,
     ]
-    result = run_ffmpeg(cmd, "Variant", 180)
+    result = run_ffmpeg(cmd, f"Variant segment {index}", 240, cancel_check=cancel_check)
     if result.returncode != 0:
         raise RuntimeError("Ошибка подготовки видеоклипа")
+    logger.info("Prepared segment %d output=%s size_bytes=%d", index, out, os.path.getsize(out))
     return out
 
 
@@ -566,7 +637,7 @@ def visualizer_layout(config: dict, width: int, height: int) -> dict:
 
 
 def generate_visualizer(audio_path: str, output_path: str, preset: dict, config: dict,
-                        width: int, height: int, duration: float) -> bool:
+                        width: int, height: int, duration: float, cancel_check=None) -> bool:
     vis_type = config["type"]
     base_type = VISUALIZER_TYPES[vis_type]
     layout = visualizer_layout(config, width, height)
@@ -587,7 +658,7 @@ def generate_visualizer(audio_path: str, output_path: str, preset: dict, config:
         "-map", "[vis]", "-c:v", "libx264", "-preset", "fast", "-crf", "20",
         "-t", str(duration), output_path,
     ]
-    return run_ffmpeg(cmd, "Visualizer", 300).returncode == 0
+    return run_ffmpeg(cmd, "Visualizer", 300, cancel_check=cancel_check).returncode == 0
 
 
 def build_visualizer_overlay_filter(config: dict, width: int, height: int) -> str:
@@ -657,7 +728,8 @@ def build_crossfade_filter(segment_durations: list, effects_filter: str, transit
 
 def assemble_raw_video(prepared: list, durations: list, transition_style: str,
                        effects_filter: str, audio_duration: float, tmpdir: str,
-                       raw_video: str, fallback_name: str | None = None) -> tuple[bool, str]:
+                       raw_video: str, fallback_name: str | None = None,
+                       cancel_check=None) -> tuple[bool, str]:
     """Assemble prepared segments and retain stderr for recovery reporting."""
     logger.info("Raw assembly transition_style=%s", transition_style)
     logger.info("Raw assembly effects_filter=%s", effects_filter)
@@ -684,7 +756,22 @@ def assemble_raw_video(prepared: list, durations: list, transition_style: str,
         ]
 
     logger.info("Raw ffmpeg command: %s", " ".join(cmd))
-    result = run_ffmpeg(cmd, f"Raw video ({fallback_name or 'primary'})", 3600)
+    result = run_ffmpeg(cmd, f"Raw video ({fallback_name or 'primary'})", 3600, cancel_check=cancel_check)
+    stderr = result.stderr.decode(errors="replace") if result.stderr else ""
+    return result.returncode == 0, stderr
+
+
+def concat_video_files(paths: list[str], tmpdir: str, output_path: str,
+                       duration: float, cancel_check=None) -> tuple[bool, str]:
+    concat_list = os.path.join(tmpdir, "concat_chunks.txt")
+    with open(concat_list, "w", encoding="utf-8") as concat_file:
+        for path in paths:
+            concat_file.write(f"file '{path}'\n")
+    cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list,
+        "-c", "copy", "-t", str(duration), output_path,
+    ]
+    result = run_ffmpeg(cmd, "Final raw chunk concat", 3600, cancel_check=cancel_check)
     stderr = result.stderr.decode(errors="replace") if result.stderr else ""
     return result.returncode == 0, stderr
 
@@ -692,7 +779,8 @@ def assemble_raw_video(prepared: list, durations: list, transition_style: str,
 def build_video(clips: list, audio_path: str, style: str, user_overrides: dict | None,
                 tmpdir: str, output_path: str, progress_callback=None,
                 montage_config: dict | None = None, visualizer_config: dict | None = None,
-                effects_config: dict | None = None, effects_intensity: str | None = None) -> dict:
+                effects_config: dict | None = None, effects_intensity: str | None = None,
+                cancel_check=None, status_callback=None) -> dict:
     preset = STYLE_PRESETS.get(style, STYLE_PRESETS["phonk"])
     montage = normalize_montage_config(montage_config)
     visualizer = normalize_visualizer_config(visualizer_config, preset)
@@ -713,7 +801,7 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
     if progress_callback:
         progress_callback(f"30% Audio and BPM analyzed: {bpm:.0f} BPM, {audio_duration:.1f} sec.")
 
-    target_duration = segment_duration_for_mode(bpm, montage["beat_cut_mode"], style)
+    beat_duration = 60.0 / bpm if bpm > 0 else 0.5
     width, height = clips[0]["width"], clips[0]["height"]
     target_energy = float(np.mean([clip.get("visual_energy", 0) for clip in clips]))
     sequence = []
@@ -723,73 +811,146 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
     elapsed = 0.0
     overlap = 0.35 if montage["transition_style"] == "crossfade" else 0.0
     while elapsed < audio_duration:
+        beat_count = choose_segment_beat_count(montage["beat_cut_mode"], style, bpm)
+        target_duration = segment_duration_for_beat_count(bpm, beat_count)
         needed_duration = audio_duration - elapsed + (overlap if sequence else 0.0)
         segment_duration = min(target_duration, max(2.0, needed_duration))
         selected = current if not sequence else choose_next_clip(
             current, clips, recent_paths, usage_counts, montage["clip_order_mode"], target_energy
         )
-        selected = {**selected, "_segment_duration": segment_duration, "_variant": random.choice(allowed_variants(montage))}
+        selected = {
+            **selected,
+            "_segment_duration": segment_duration,
+            "_beat_count": beat_count,
+            "_variant": random.choice(allowed_variants(montage)),
+        }
         sequence.append(selected)
         recent_paths.append(selected["path"])
         usage_counts[selected["path"]] = usage_counts.get(selected["path"], 0) + 1
         logger.info(
-            "Segment %d source=%s variant=%s duration=%.3f recent_sources=%s",
-            len(sequence), selected["path"], selected["_variant"], segment_duration, recent_paths[-4:],
+            "Segment %d beat_count=%d duration=%.3f source=%s variant=%s recent_sources=%s",
+            len(sequence), beat_count, segment_duration, selected["path"], selected["_variant"], recent_paths[-4:],
         )
         current = selected
         elapsed += segment_duration - (overlap if len(sequence) > 1 else 0.0)
-    logger.info("Final sequence length: %d segments, target duration %.3fs", len(sequence), target_duration)
+    logger.info(
+        "Final sequence length: %d segments, beat_duration %.3fs mode=%s",
+        len(sequence), beat_duration, montage["beat_cut_mode"],
+    )
     apply_speed_accents(sequence, montage, bpm, style)
-    prepared = []
-    durations = []
-    for index, clip in enumerate(sequence, start=1):
-        durations.append(clip["_segment_duration"])
-        logger.info("Preparing segment %d source=%s speed=%.2fx", index, clip["path"], clip["_speed"])
-        prepared.append(prepare_clip_variant(
-            clip, tmpdir, clip["_variant"], clip["_segment_duration"],
-            montage["allow_random_trim"], width, height, index, clip["_speed"],
-        ))
-    if progress_callback:
-        progress_callback("60% Video segments prepared.")
-
     effects_filter = build_effects_filter(preset, effects, effects_intensity)
     raw_video = os.path.join(tmpdir, "raw_video.mp4")
-    raw_ok, last_stderr = assemble_raw_video(
-        prepared, durations, montage["transition_style"], effects_filter,
-        audio_duration, tmpdir, raw_video,
-    )
-    if not raw_ok:
-        raw_ok, last_stderr = assemble_raw_video(
-            prepared, durations, "cut", effects_filter,
-            audio_duration, tmpdir, raw_video, "retry_1_hard_cut_selected_effects",
+    chunk_paths = []
+    last_stderr = ""
+    chunk_size = 40
+    total_chunks = max(1, (len(sequence) + chunk_size - 1) // chunk_size)
+    for chunk_number, start_index in enumerate(range(0, len(sequence), chunk_size), start=1):
+        if cancel_check and cancel_check():
+            raise RenderCanceled("Render canceled")
+        chunk = sequence[start_index:start_index + chunk_size]
+        prepared = []
+        durations = []
+        logger.info(
+            "Prepare chunk %d/%d segments=%d tmp_size_bytes=%d",
+            chunk_number, total_chunks, len(chunk), dir_size_bytes(tmpdir),
         )
-    if not raw_ok:
-        raw_ok, last_stderr = assemble_raw_video(
-            prepared, durations, "cut", "null",
-            audio_duration, tmpdir, raw_video, "retry_2_hard_cut_no_effects",
-        )
-    if not raw_ok:
-        try:
-            fallback_prepared = [
-                prepare_clip_variant(
-                    clip, tmpdir, "normal", clip["_segment_duration"],
-                    False, width, height, index + len(sequence),
-                )
-                for index, clip in enumerate(sequence, start=1)
-            ]
-            raw_ok, last_stderr = assemble_raw_video(
-                fallback_prepared, durations, "cut", "null",
-                audio_duration, tmpdir, raw_video, "retry_3_normal_no_trim",
+        if status_callback:
+            status_callback(
+                "preparing_segments",
+                35 + int(25 * (chunk_number - 1) / total_chunks),
+                f"Preparing chunk {chunk_number}/{total_chunks}",
+                current_segment=start_index + 1,
+                total_segments=len(sequence),
+                chunk=chunk_number,
+                total_chunks=total_chunks,
             )
-        except Exception as exc:
-            logger.error("Final raw assembly fallback preparation failed: %s", exc, exc_info=True)
+        for offset, clip in enumerate(chunk, start=1):
+            index = start_index + offset
+            durations.append(clip["_segment_duration"])
+            logger.info(
+                "Preparing segment %d/%d beat_count=%d source=%s speed=%.2fx tmp_size_bytes=%d",
+                index, len(sequence), clip["_beat_count"], clip["path"], clip["_speed"], dir_size_bytes(tmpdir),
+            )
+            try:
+                prepared.append(prepare_clip_variant(
+                    clip, tmpdir, clip["_variant"], clip["_segment_duration"],
+                    montage["allow_random_trim"], width, height, index, clip["_speed"],
+                    cancel_check=cancel_check,
+                ))
+            except Exception as exc:
+                logger.warning("Segment %d primary variant failed: %s; retrying normal/no trim", index, exc)
+                try:
+                    prepared.append(prepare_clip_variant(
+                        clip, tmpdir, "normal", clip["_segment_duration"],
+                        False, width, height, index, 1.0, cancel_check=cancel_check,
+                    ))
+                except Exception as retry_exc:
+                    logger.error("Segment %d skipped after retry failure: %s", index, retry_exc, exc_info=True)
+                    durations.pop()
+            if status_callback:
+                status_callback(
+                    "preparing_segments",
+                    35 + int(25 * index / max(1, len(sequence))),
+                    f"Prepared segment {index}/{len(sequence)}",
+                    current_segment=index,
+                    total_segments=len(sequence),
+                    chunk=chunk_number,
+                    total_chunks=total_chunks,
+                )
+            if progress_callback and (index == len(sequence) or index % 25 == 0):
+                progress_callback(f"Preparing segments {index}/{len(sequence)}.")
+        if not prepared:
+            logger.warning("Chunk %d had no prepared segments; skipping", chunk_number)
+            continue
+        chunk_duration = sum(durations)
+        if montage["transition_style"] == "crossfade" and len(durations) > 1:
+            chunk_duration -= 0.35 * (len(durations) - 1)
+        chunk_output = os.path.join(tmpdir, f"chunk_{chunk_number:04d}.mp4")
+        logger.info("Assembling chunk %d/%d prepared=%d duration=%.3f", chunk_number, total_chunks, len(prepared), chunk_duration)
+        if status_callback:
+            status_callback(
+                "assembling_raw_video",
+                60 + int(15 * (chunk_number - 1) / total_chunks),
+                f"Assembling chunk {chunk_number}/{total_chunks}",
+                chunk=chunk_number,
+                total_chunks=total_chunks,
+            )
+        raw_ok, last_stderr = assemble_raw_video(
+            prepared, durations, montage["transition_style"], effects_filter,
+            chunk_duration, tmpdir, chunk_output, f"chunk_{chunk_number}", cancel_check=cancel_check,
+        )
+        if not raw_ok and montage["transition_style"] != "cut":
+            raw_ok, last_stderr = assemble_raw_video(
+                prepared, durations, "cut", effects_filter,
+                chunk_duration, tmpdir, chunk_output, f"chunk_{chunk_number}_cut", cancel_check=cancel_check,
+            )
+        if not raw_ok:
+            raw_ok, last_stderr = assemble_raw_video(
+                prepared, durations, "cut", "null",
+                chunk_duration, tmpdir, chunk_output, f"chunk_{chunk_number}_no_effects", cancel_check=cancel_check,
+            )
+        remove_files(prepared)
+        logger.info("Cleaned chunk %d variants tmp_size_bytes=%d", chunk_number, dir_size_bytes(tmpdir))
+        if not raw_ok:
+            break
+        chunk_paths.append(chunk_output)
+    raw_ok = bool(chunk_paths)
+    if raw_ok:
+        if len(chunk_paths) == 1:
+            raw_video = chunk_paths[0]
+        else:
+            raw_ok, last_stderr = concat_video_files(chunk_paths, tmpdir, raw_video, audio_duration, cancel_check=cancel_check)
     if not raw_ok:
         stderr_summary = (last_stderr.strip() or "ffmpeg did not return an error message")[-800:]
-        raise RuntimeError(f"Ошибка сборки видео: {stderr_summary}")
+        raise RuntimeError(f"?????? ?????? ?????: {stderr_summary}")
+    if progress_callback:
+        progress_callback("75% Raw video assembled.")
     vis_video = os.path.join(tmpdir, "visualizer.mp4")
     vis_ok = False
     if visualizer["enabled"]:
-        vis_ok = generate_visualizer(audio_path, vis_video, preset, visualizer, width, height, audio_duration)
+        if status_callback:
+            status_callback("final_render", 78, "Generating visualizer overlay")
+        vis_ok = generate_visualizer(audio_path, vis_video, preset, visualizer, width, height, audio_duration, cancel_check=cancel_check)
         if progress_callback:
             progress_callback("80% Visualizer generated." if vis_ok else "80% Visualizer unavailable; continuing without it.")
     else:
@@ -799,6 +960,8 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
 
     if progress_callback:
         progress_callback("90% Final render.")
+    if status_callback:
+        status_callback("final_render", 90, "Final render started")
     if vis_ok and os.path.exists(vis_video):
         overlay_filter = build_visualizer_overlay_filter(visualizer, width, height)
         final_cmd = [
@@ -813,7 +976,7 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
             "-c:v", "libx264", "-preset", "medium", "-crf", "17", "-c:a", "aac",
             "-b:a", "320k", "-t", str(audio_duration), output_path,
         ]
-    if run_ffmpeg(final_cmd, "Final render", 3600).returncode != 0:
+    if run_ffmpeg(final_cmd, "Final render", 3600, cancel_check=cancel_check).returncode != 0:
         raise RuntimeError("Ошибка финального рендера")
 
     file_size = os.path.getsize(output_path) / (1024 * 1024 * 1024)
@@ -824,5 +987,5 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
         "clips_used": len(sequence),
         "file_size_gb": round(file_size, 2),
         "output": output_path,
-        "segment_duration": round(target_duration, 3),
+        "segment_duration": round(beat_duration, 3),
     }

@@ -12,14 +12,26 @@ import requests
 from flask import Flask, jsonify, request
 
 from drive_handler import download_audio_file, download_folder_videos
-from storage_handler import upload_to_gcs
-from video_processor import analyze_clip, build_video
+from storage_handler import (
+    is_job_cancel_requested,
+    read_job_status,
+    signed_job_url,
+    upload_to_gcs,
+    write_job_status,
+)
+from video_processor import RenderCanceled, analyze_clip, build_video
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 jobs = {}
+
+
+def status_payload(stage: str, progress: int, message: str, **extra) -> dict:
+    payload = {"stage": stage, "progress": progress, "message": message}
+    payload.update(extra)
+    return payload
 
 
 def extract_drive_id(url: str, is_folder: bool) -> str:
@@ -54,13 +66,29 @@ def run_render_job(job_id: str, payload: dict):
     user_id = payload["user_id"]
     bot_token = payload["bot_token"]
     tmpdir = tempfile.mkdtemp()
+    bucket_name = os.environ.get("OUTPUT_BUCKET_NAME", "")
+
+    def update_status(stage: str, progress: int, message: str, **extra):
+        jobs[job_id] = stage
+        try:
+            write_job_status(job_id, status_payload(stage, progress, message, **extra), bucket_name)
+        except Exception as exc:
+            logger.error("Job %s status write failed: %s", job_id, exc)
+
+    def cancel_requested() -> bool:
+        try:
+            return is_job_cancel_requested(job_id, bucket_name)
+        except Exception as exc:
+            logger.error("Job %s cancel check failed: %s", job_id, exc)
+            return False
+
     try:
-        bucket_name = os.environ.get("OUTPUT_BUCKET_NAME", "")
         if not bucket_name:
             raise ValueError(
                 "OUTPUT_BUCKET_NAME is not configured. Final video upload requires Google Cloud Storage."
             )
         object_name = f"renders/{job_id}/FINAL_VIDEO.mp4"
+        update_status("queued", 0, "Job queued", output_object=object_name)
         logger.info("Selected output bucket: %s", bucket_name)
         logger.info("Selected output object path: %s", object_name)
 
@@ -82,13 +110,24 @@ def run_render_job(job_id: str, payload: dict):
             job_id, visualizer_config, effects_config, effects_intensity,
         )
 
-        jobs[job_id] = "downloading"
+        update_status("downloading", 5, "Starting Drive download")
         video_folder_id = extract_drive_id(payload["video_link"], is_folder=True)
         audio_file_id = extract_drive_id(payload["audio_link"], is_folder=False)
         if not video_folder_id or not audio_file_id:
             raise ValueError("Не могу распознать ссылки Drive")
 
-        video_clips = download_folder_videos(video_folder_id, tmpdir)
+        video_clips = download_folder_videos(
+            video_folder_id,
+            tmpdir,
+            progress_callback=lambda current, total, name: update_status(
+                "downloading", 5 + int(15 * current / max(1, total)),
+                f"Downloaded clip {current}/{total}",
+                clips_found=total,
+                clips_downloaded=current,
+                current_file=name,
+            ),
+            cancel_check=cancel_requested,
+        )
         logger.info("Number of clips downloaded: %d", len(video_clips))
         if not video_clips:
             raise ValueError("В папке нет MP4 файлов")
@@ -96,20 +135,36 @@ def run_render_job(job_id: str, payload: dict):
         audio_path = download_audio_file(audio_file_id, tmpdir)
         if not audio_path:
             raise ValueError("Не удалось скачать аудиофайл")
+        update_status(
+            "downloading", 20,
+            f"Files downloaded: {len(video_clips)} clips and audio.",
+            clips_found=len(video_clips),
+            clips_downloaded=len(video_clips),
+        )
         notify_telegram(bot_token, user_id, f"10% Files downloaded: {len(video_clips)} clips and audio.")
 
-        jobs[job_id] = "analyzing"
+        update_status("analyzing", 22, "Analyzing clips", clips_found=len(video_clips))
         clips = []
-        for video_path in video_clips:
+        for index, video_path in enumerate(video_clips, start=1):
+            if cancel_requested():
+                raise RenderCanceled("Render canceled")
             clip_data = analyze_clip(video_path)
             if clip_data:
                 clips.append(clip_data)
             else:
                 logger.warning("Rejected unreadable clip: %s", video_path)
+            if index == len(video_clips) or index % 5 == 0:
+                update_status(
+                    "analyzing", 22 + int(8 * index / max(1, len(video_clips))),
+                    f"Analyzed clip {index}/{len(video_clips)}",
+                    clips_found=len(video_clips),
+                    clips_analyzed=index,
+                    clips_accepted=len(clips),
+                )
         logger.info("Number of clips analyzed: %d", len(clips))
         if not clips:
             raise ValueError("Не удалось проанализировать видеоклипы")
-        jobs[job_id] = "rendering"
+        update_status("preparing_segments", 30, "Building montage and preparing segments")
         output_path = os.path.join(tmpdir, "FINAL_VIDEO.mp4")
 
         result = build_video(
@@ -124,11 +179,20 @@ def run_render_job(job_id: str, payload: dict):
             visualizer_config=visualizer_config,
             effects_config=effects_config,
             effects_intensity=effects_intensity,
+            cancel_check=cancel_requested,
+            status_callback=update_status,
         )
 
-        jobs[job_id] = "uploading"
+        update_status("uploading", 95, "Uploading final video", output_object=object_name)
         download_link = upload_to_gcs(output_path, bucket_name, object_name)
-        jobs[job_id] = "done"
+        update_status(
+            "done", 100, "Completed",
+            output_object=object_name,
+            download_link=download_link,
+            duration=result["duration"],
+            bpm=result["bpm"],
+            clips_used=result["clips_used"],
+        )
         notify_telegram(
             bot_token,
             user_id,
@@ -142,9 +206,13 @@ def run_render_job(job_id: str, payload: dict):
             "Отправьте /start для нового видео.",
             parse_mode=None,
         )
+    except RenderCanceled:
+        logger.warning("Job %s canceled", job_id, exc_info=True)
+        update_status("canceled", 0, "Render canceled")
+        notify_telegram(bot_token, user_id, "Render canceled. Send /start to create a new montage.", parse_mode=None)
     except Exception as exc:
         logger.error("Job %s failed: %s", job_id, exc, exc_info=True)
-        jobs[job_id] = "failed"
+        update_status("failed", 0, str(exc)[:1000], error=str(exc)[:1000])
         notify_telegram(
             bot_token,
             user_id,
@@ -167,8 +235,11 @@ def render():
                 return jsonify({"error": f"Missing field: {field}"}), 400
         job_id = str(uuid.uuid4())
         jobs[job_id] = "queued"
+        write_job_status(job_id, status_payload("queued", 0, "Job accepted"))
+        status_url = signed_job_url(job_id, "status.json", "GET")
+        cancel_url = signed_job_url(job_id, "cancel.flag", "PUT")
         threading.Thread(target=run_render_job, args=(job_id, payload), daemon=True).start()
-        return jsonify({"job_id": job_id, "status": "queued"}), 200
+        return jsonify({"job_id": job_id, "status": "queued", "status_url": status_url, "cancel_url": cancel_url}), 200
     except Exception as exc:
         logger.error("Render endpoint error: %s", exc)
         return jsonify({"error": str(exc)}), 500
@@ -176,7 +247,8 @@ def render():
 
 @app.route("/status/<job_id>", methods=["GET"])
 def status(job_id):
-    return jsonify({"job_id": job_id, "status": jobs.get(job_id, "not_found")})
+    stored = read_job_status(job_id)
+    return jsonify(stored or {"job_id": job_id, "status": jobs.get(job_id, "not_found")})
 
 
 @app.route("/health", methods=["GET"])

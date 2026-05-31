@@ -6,6 +6,7 @@ import os
 import io
 import json
 import logging
+import re
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
@@ -24,16 +25,48 @@ def get_service():
     return build('drive', 'v3', credentials=creds)
 
 
-def download_folder_videos(folder_id: str, tmpdir: str) -> list:
+def download_folder_videos(folder_id: str, tmpdir: str, progress_callback=None, cancel_check=None) -> list:
     """Download all MP4 files from a Drive folder."""
     service = get_service()
-    query = f"'{folder_id}' in parents and (mimeType='video/mp4' or name contains '.mp4') and trashed=false"
-    results = service.files().list(q=query, fields="files(id,name,size)", pageSize=50).execute()
-    files = results.get("files", [])
-    logger.info(f"Found {len(files)} video files")
+    query = f"'{folder_id}' in parents and trashed=false"
+    files = []
+    page_token = None
+    while True:
+        results = service.files().list(
+            q=query,
+            fields="nextPageToken, files(id,name,size,mimeType)",
+            pageSize=1000,
+            pageToken=page_token,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        files.extend(results.get("files", []))
+        page_token = results.get("nextPageToken")
+        if not page_token:
+            break
+
+    def natural_key(item: dict):
+        return [
+            int(part) if part.isdigit() else part.lower()
+            for part in re.split(r"(\d+)", item.get("name", ""))
+        ]
+
+    mp4_files = sorted(
+        [
+            item for item in files
+            if item.get("name", "").lower().endswith(".mp4")
+            or item.get("mimeType") == "video/mp4"
+        ],
+        key=natural_key,
+    )
+    logger.info("Drive folder total files found: %d", len(files))
+    logger.info("Drive folder MP4 files found: %d", len(mp4_files))
 
     downloaded = []
-    for f in files:
+    total = len(mp4_files)
+    for index, f in enumerate(mp4_files, start=1):
+        if cancel_check and cancel_check():
+            raise RuntimeError("Render canceled")
         try:
             out = os.path.join(tmpdir, f["name"])
             req = service.files().get_media(fileId=f["id"])
@@ -44,9 +77,11 @@ def download_folder_videos(folder_id: str, tmpdir: str) -> list:
                 _, done = dl.next_chunk()
             fh.close()
             downloaded.append(out)
-            logger.info(f"Downloaded video: {f['name']}")
+            logger.info("Downloaded clip %d/%d: %s", index, total, f["name"])
+            if progress_callback:
+                progress_callback(index, total, f["name"])
         except Exception as e:
-            logger.error(f"Failed to download {f['name']}: {e}")
+            logger.error("Failed to download clip %d/%d %s: %s", index, total, f.get("name"), e)
 
     return downloaded
 
