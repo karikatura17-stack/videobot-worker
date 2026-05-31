@@ -495,6 +495,16 @@ def remove_files(paths: list[str]) -> None:
             logger.warning("Could not remove temp file %s: %s", path, exc)
 
 
+def ffmpeg_timeout(env_name: str, default_seconds: int = 21600) -> int:
+    value = os.environ.get(env_name, str(default_seconds))
+    try:
+        timeout = int(value)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s", env_name, value, default_seconds)
+        return default_seconds
+    return max(60, timeout)
+
+
 def run_ffmpeg(cmd: list, task: str, timeout: int, cancel_check=None):
     cmd = with_ffmpeg_nostdin(cmd)
     logger.info("%s ffmpeg start: %s", task, " ".join(cmd))
@@ -756,7 +766,8 @@ def assemble_raw_video(prepared: list, durations: list, transition_style: str,
         ]
 
     logger.info("Raw ffmpeg command: %s", " ".join(cmd))
-    result = run_ffmpeg(cmd, f"Raw video ({fallback_name or 'primary'})", 3600, cancel_check=cancel_check)
+    chunk_timeout = ffmpeg_timeout("CHUNK_ASSEMBLY_TIMEOUT_SECONDS")
+    result = run_ffmpeg(cmd, f"Raw video ({fallback_name or 'primary'})", chunk_timeout, cancel_check=cancel_check)
     stderr = result.stderr.decode(errors="replace") if result.stderr else ""
     return result.returncode == 0, stderr
 
@@ -771,7 +782,8 @@ def concat_video_files(paths: list[str], tmpdir: str, output_path: str,
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list,
         "-c", "copy", "-t", str(duration), output_path,
     ]
-    result = run_ffmpeg(cmd, "Final raw chunk concat", 3600, cancel_check=cancel_check)
+    raw_timeout = ffmpeg_timeout("RAW_ASSEMBLY_TIMEOUT_SECONDS")
+    result = run_ffmpeg(cmd, "Final raw chunk concat", raw_timeout, cancel_check=cancel_check)
     stderr = result.stderr.decode(errors="replace") if result.stderr else ""
     return result.returncode == 0, stderr
 
@@ -962,22 +974,40 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
         progress_callback("90% Final render.")
     if status_callback:
         status_callback("final_render", 90, "Final render started")
+    final_render_timeout = ffmpeg_timeout("FINAL_RENDER_TIMEOUT_SECONDS")
+    final_render_start = time.time()
+    raw_video_size = os.path.getsize(raw_video) if os.path.exists(raw_video) else 0
     if vis_ok and os.path.exists(vis_video):
         overlay_filter = build_visualizer_overlay_filter(visualizer, width, height)
+        final_mode = "re-encode video with visualizer overlay"
         final_cmd = [
             "ffmpeg", "-y", "-i", raw_video, "-i", vis_video, "-i", audio_path,
             "-filter_complex", overlay_filter,
-            "-map", "[out]", "-map", "2:a", "-c:v", "libx264", "-preset", "medium",
+            "-map", "[out]", "-map", "2:a", "-c:v", "libx264", "-preset", "fast",
             "-crf", "17", "-c:a", "aac", "-b:a", "320k", "-t", str(audio_duration), output_path,
         ]
     else:
+        final_mode = "copy video and mux audio"
         final_cmd = [
             "ffmpeg", "-y", "-i", raw_video, "-i", audio_path, "-map", "0:v", "-map", "1:a",
-            "-c:v", "libx264", "-preset", "medium", "-crf", "17", "-c:a", "aac",
-            "-b:a", "320k", "-t", str(audio_duration), output_path,
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "320k", "-shortest", output_path,
         ]
-    if run_ffmpeg(final_cmd, "Final render", 3600, cancel_check=cancel_check).returncode != 0:
-        raise RuntimeError("Ошибка финального рендера")
+    logger.info(
+        "Final render mode=%s visualizer_enabled=%s visualizer_generated=%s timeout=%ss "
+        "raw_video=%s raw_size_bytes=%d audio=%s output=%s",
+        final_mode, visualizer["enabled"], vis_ok, final_render_timeout,
+        raw_video, raw_video_size, audio_path, output_path,
+    )
+    final_result = run_ffmpeg(final_cmd, "Final render", final_render_timeout, cancel_check=cancel_check)
+    if final_result.returncode != 0:
+        stderr_tail = final_result.stderr.decode(errors="replace")[-1200:] if final_result.stderr else ""
+        if final_result.returncode == 124:
+            raise RuntimeError(f"Final render timed out after {final_render_timeout} seconds: {stderr_tail}")
+        raise RuntimeError(f"Final render ffmpeg failed: {stderr_tail or 'no stderr output'}")
+    logger.info(
+        "Final render completed output_size_bytes=%d elapsed_seconds=%.1f",
+        os.path.getsize(output_path), time.time() - final_render_start,
+    )
 
     file_size = os.path.getsize(output_path) / (1024 * 1024 * 1024)
     minutes, seconds = divmod(int(audio_duration), 60)
