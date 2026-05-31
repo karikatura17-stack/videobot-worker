@@ -7,5 +7,6 @@ google-api-python-client==2.140.0
 google-auth==2.35.0
 google-auth-httplib2==0.2.0
 google-cloud-storage==2.18.2
+google-cloud-run==0.16.0
 soundfile==0.12.1
 requests==2.32.3

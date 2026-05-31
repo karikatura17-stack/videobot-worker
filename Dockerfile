@@ -3,11 +3,11 @@ FROM python:3.11-slim
 # Install ffmpeg and OpenCV dependencies
 RUN apt-get update && apt-get install -y \
     ffmpeg \
-    libgl1 \
+    libgl1-mesa-glx \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
-    libxrender1 \
+    libxrender-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -16,6 +16,7 @@ COPY requirements_worker.txt .
 RUN pip install --no-cache-dir -r requirements_worker.txt
 
 COPY worker.py .
+COPY render_job.py .
 COPY video_processor.py .
 COPY drive_handler.py .
 COPY storage_handler.py .

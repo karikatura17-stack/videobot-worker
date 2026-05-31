@@ -77,6 +77,24 @@ def read_job_status(job_id: str, bucket_name: str | None = None) -> dict | None:
     return json.loads(blob.download_as_text())
 
 
+def write_job_config(job_id: str, payload: dict, bucket_name: str | None = None) -> None:
+    bucket = storage_context(bucket_name)
+    blob = bucket.blob(f"jobs/{job_id}/config.json")
+    blob.upload_from_string(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        content_type="application/json",
+    )
+    logger.info("Job config written: gs://%s/jobs/%s/config.json", bucket.name, job_id)
+
+
+def read_job_config(job_id: str, bucket_name: str | None = None) -> dict:
+    bucket = storage_context(bucket_name)
+    blob = bucket.blob(f"jobs/{job_id}/config.json")
+    if not blob.exists():
+        raise FileNotFoundError(f"Job config not found: jobs/{job_id}/config.json")
+    return json.loads(blob.download_as_text())
+
+
 def request_job_cancel(job_id: str, bucket_name: str | None = None) -> None:
     bucket = storage_context(bucket_name)
     blob = bucket.blob(f"jobs/{job_id}/cancel.flag")
