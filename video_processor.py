@@ -163,7 +163,17 @@ DEFAULT_MONTAGE_CONFIG = {
     "speed_accents_mode": "off",
     "speed_accents_amount": 0.20,
     "speed_accents_speed": 1.25,
+    "zoom_pulse": "off",
+    "punch_zoom": "off",
+    "bass_shake": "off",
+    "flash_hit": "off",
 }
+
+MOTION_FX_LEVELS = {"off", "soft", "normal", "strong"}
+ZOOM_PULSE_AMOUNTS = {"soft": 0.012, "normal": 0.022, "strong": 0.035}
+PUNCH_ZOOM_AMOUNTS = {"soft": 0.025, "normal": 0.045, "strong": 0.070}
+BASS_SHAKE_PIXELS = {"soft": 4, "normal": 8, "strong": 14}
+FLASH_HIT_BRIGHTNESS = {"soft": 0.05, "normal": 0.09, "strong": 0.14}
 
 
 
@@ -340,6 +350,9 @@ def normalize_montage_config(config: dict | None) -> dict:
         merged["speed_accents_speed"] = 1.25
     if merged["speed_accents_speed"] not in {1.15, 1.25, 1.35, 1.50}:
         merged["speed_accents_speed"] = 1.25
+    for option in ("zoom_pulse", "punch_zoom", "bass_shake", "flash_hit"):
+        if merged.get(option) not in MOTION_FX_LEVELS:
+            merged[option] = "off"
     for option in ("allow_mirror", "allow_reverse", "allow_mirror_reverse", "allow_random_trim"):
         merged[option] = bool(merged[option])
     return merged
@@ -549,9 +562,55 @@ def run_ffmpeg(cmd: list, task: str, timeout: int, cancel_check=None):
     return result
 
 
+def build_motion_fx_filters(config: dict, width: int, height: int) -> list[str]:
+    filters = []
+    zoom_pulse = config.get("zoom_pulse", "off")
+    if zoom_pulse != "off":
+        amount = ZOOM_PULSE_AMOUNTS[zoom_pulse]
+        filters.extend([
+            (
+                "scale="
+                f"w='iw*(1+{amount:.4f}*(0.5+0.5*sin(2*PI*t*1.25)))':"
+                f"h='ih*(1+{amount:.4f}*(0.5+0.5*sin(2*PI*t*1.25)))':eval=frame"
+            ),
+            f"crop={width}:{height}:x='(iw-ow)/2':y='(ih-oh)/2'",
+        ])
+
+    punch_zoom = config.get("punch_zoom", "off")
+    if punch_zoom != "off":
+        amount = PUNCH_ZOOM_AMOUNTS[punch_zoom]
+        filters.extend([
+            (
+                "scale="
+                f"w='iw*(1+{amount:.4f}*exp(-8*t))':"
+                f"h='ih*(1+{amount:.4f}*exp(-8*t))':eval=frame"
+            ),
+            f"crop={width}:{height}:x='(iw-ow)/2':y='(ih-oh)/2'",
+        ])
+
+    bass_shake = config.get("bass_shake", "off")
+    if bass_shake != "off":
+        pixels = BASS_SHAKE_PIXELS[bass_shake]
+        filters.extend([
+            f"scale={width + pixels * 2}:{height + pixels * 2}",
+            (
+                f"crop={width}:{height}:"
+                f"x='(iw-ow)/2+{pixels}*sin(2*PI*t*9)':"
+                f"y='(ih-oh)/2+{pixels}*cos(2*PI*t*11)'"
+            ),
+        ])
+
+    flash_hit = config.get("flash_hit", "off")
+    if flash_hit != "off":
+        amount = FLASH_HIT_BRIGHTNESS[flash_hit]
+        filters.append(f"eq=brightness='{amount:.3f}*exp(-10*t)':eval=frame")
+
+    return filters
+
+
 def prepare_clip_variant(clip: dict, tmpdir: str, variant: str, target_duration: float,
                          random_trim: bool, width: int, height: int, index: int,
-                         speed: float = 1.0, cancel_check=None) -> str:
+                         speed: float = 1.0, motion_fx: dict | None = None, cancel_check=None) -> str:
     src = clip["path"]
     out = os.path.join(tmpdir, f"variant_{index:04d}_{variant}.mp4")
     source_duration = target_duration * speed
@@ -575,6 +634,9 @@ def prepare_clip_variant(clip: dict, tmpdir: str, variant: str, target_duration:
     filters.extend([
         f"scale={width}:{height}:force_original_aspect_ratio=decrease",
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
+    ])
+    filters.extend(build_motion_fx_filters(motion_fx or {}, width, height))
+    filters.extend([
         "setsar=1",
         "format=yuv420p",
     ])
@@ -887,14 +949,14 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
                 prepared.append(prepare_clip_variant(
                     clip, tmpdir, clip["_variant"], clip["_segment_duration"],
                     montage["allow_random_trim"], width, height, index, clip["_speed"],
-                    cancel_check=cancel_check,
+                    motion_fx=montage, cancel_check=cancel_check,
                 ))
             except Exception as exc:
                 logger.warning("Segment %d primary variant failed: %s; retrying normal/no trim", index, exc)
                 try:
                     prepared.append(prepare_clip_variant(
                         clip, tmpdir, "normal", clip["_segment_duration"],
-                        False, width, height, index, 1.0, cancel_check=cancel_check,
+                        False, width, height, index, 1.0, motion_fx=None, cancel_check=cancel_check,
                     ))
                 except Exception as retry_exc:
                     logger.error("Segment %d skipped after retry failure: %s", index, retry_exc, exc_info=True)
