@@ -5,6 +5,7 @@ import os
 import random
 import subprocess
 import time
+import json
 
 import cv2
 import librosa
@@ -170,10 +171,12 @@ DEFAULT_MONTAGE_CONFIG = {
 }
 
 MOTION_FX_LEVELS = {"off", "soft", "normal", "strong"}
-ZOOM_PULSE_AMOUNTS = {"soft": 0.012, "normal": 0.022, "strong": 0.035}
-PUNCH_ZOOM_AMOUNTS = {"soft": 0.025, "normal": 0.045, "strong": 0.070}
-BASS_SHAKE_PIXELS = {"soft": 4, "normal": 8, "strong": 14}
-FLASH_HIT_BRIGHTNESS = {"soft": 0.05, "normal": 0.09, "strong": 0.14}
+MOTION_FX_KEYS = ("zoom_pulse", "punch_zoom", "bass_shake", "flash_hit")
+MOTION_FX_RATES = {"soft": 0.08, "normal": 0.12, "strong": 0.18}
+ZOOM_PULSE_AMOUNTS = {"soft": 0.025, "normal": 0.045, "strong": 0.075}
+PUNCH_ZOOM_AMOUNTS = {"soft": 0.060, "normal": 0.100, "strong": 0.160}
+BASS_SHAKE_PIXELS = {"soft": 8, "normal": 16, "strong": 28}
+FLASH_HIT_BRIGHTNESS = {"soft": 0.10, "normal": 0.18, "strong": 0.28}
 
 
 
@@ -470,6 +473,100 @@ def apply_speed_accents(sequence: list, config: dict, bpm: float, style: str) ->
     return amount, speed
 
 
+def motion_fx_config(config: dict) -> dict:
+    return {key: config.get(key, "off") for key in MOTION_FX_KEYS}
+
+
+def assign_motion_fx(sequence: list, config: dict) -> dict:
+    for clip in sequence:
+        clip["_motion_fx"] = "none"
+        clip["_motion_fx_level"] = "off"
+        clip["_motion_filter"] = ""
+        clip["_motion_filter_applied"] = False
+
+    enabled = [(key, config.get(key, "off")) for key in MOTION_FX_KEYS if config.get(key, "off") != "off"]
+    debug_force = os.environ.get("MOTION_FX_DEBUG_FORCE", "0") == "1"
+    logger.info(
+        "Motion FX config: zoom_pulse=%s punch_zoom=%s bass_shake=%s flash_hit=%s debug_force=%s",
+        config.get("zoom_pulse", "off"), config.get("punch_zoom", "off"),
+        config.get("bass_shake", "off"), config.get("flash_hit", "off"), debug_force,
+    )
+
+    if debug_force:
+        forced = enabled or [(key, "strong") for key in MOTION_FX_KEYS]
+        for index, clip in enumerate(sequence[:10]):
+            effect, _ = forced[index % len(forced)]
+            clip["_motion_fx"] = effect
+            clip["_motion_fx_level"] = "strong"
+            clip["_motion_fx_debug_forced"] = True
+    else:
+        available = list(range(len(sequence)))
+        random.shuffle(available)
+        for effect, level in enabled:
+            desired = min(len(available), max(1, round(len(sequence) * MOTION_FX_RATES[level])))
+            selected = available[:desired]
+            available = available[desired:]
+            for index in selected:
+                sequence[index]["_motion_fx"] = effect
+                sequence[index]["_motion_fx_level"] = level
+
+    counts = {"none": 0, **{key: 0 for key in MOTION_FX_KEYS}}
+    for clip in sequence:
+        counts[clip["_motion_fx"]] = counts.get(clip["_motion_fx"], 0) + 1
+    percentages = {
+        key: round(count / max(1, len(sequence)) * 100, 2)
+        for key, count in counts.items()
+    }
+    logger.info(
+        "Motion FX assignment: total_segments=%d zoom_pulse=%d punch_zoom=%d bass_shake=%d flash_hit=%d none=%d "
+        "pct_zoom_pulse=%.2f pct_punch_zoom=%.2f pct_bass_shake=%.2f pct_flash_hit=%.2f pct_none=%.2f",
+        len(sequence), counts["zoom_pulse"], counts["punch_zoom"], counts["bass_shake"],
+        counts["flash_hit"], counts["none"], percentages["zoom_pulse"], percentages["punch_zoom"],
+        percentages["bass_shake"], percentages["flash_hit"], percentages["none"],
+    )
+    for index, clip in enumerate(sequence[:20], start=1):
+        logger.info(
+            "Motion FX first20 segment=%03d source=%s beat_count=%s duration=%.3f speed=%.2f variant=%s selected_motion_fx=%s level=%s",
+            index, os.path.basename(clip["path"]), clip.get("_beat_count"), clip.get("_segment_duration", 0.0),
+            clip.get("_speed", 1.0), clip.get("_variant"), clip.get("_motion_fx", "none"),
+            clip.get("_motion_fx_level", "off"),
+        )
+    return {
+        "total_segments": len(sequence),
+        "motion_fx_config": motion_fx_config(config),
+        "selected_counts": counts,
+        "selected_percentages": percentages,
+        "debug_force": debug_force,
+    }
+
+
+def write_motion_fx_report(tmpdir: str, report: dict, sequence: list) -> str:
+    report_path = os.path.join(tmpdir, "motion_fx_report.json")
+    payload = {
+        **report,
+        "segments": [
+            {
+                "index": index,
+                "source": os.path.basename(clip["path"]),
+                "beat_count": clip.get("_beat_count"),
+                "duration": round(float(clip.get("_segment_duration", 0.0)), 3),
+                "speed": round(float(clip.get("_speed", 1.0)), 3),
+                "variant": clip.get("_variant"),
+                "motion_fx": clip.get("_motion_fx", "none"),
+                "motion_fx_level": clip.get("_motion_fx_level", "off"),
+                "ffmpeg_filter_applied": bool(clip.get("_motion_filter_applied", False)),
+                "ffmpeg_filter": clip.get("_motion_filter", ""),
+            }
+            for index, clip in enumerate(sequence, start=1)
+        ],
+    }
+    with open(report_path, "w", encoding="utf-8") as report_file:
+        json.dump(payload, report_file, ensure_ascii=False, indent=2)
+    logger.info("Motion FX report path=%s", report_path)
+    logger.info("Motion FX report JSON: %s", json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    return report_path
+
+
 def allowed_variants(config: dict) -> list:
     variants = ["normal"]
     if config["allow_mirror"]:
@@ -562,11 +659,10 @@ def run_ffmpeg(cmd: list, task: str, timeout: int, cancel_check=None):
     return result
 
 
-def build_motion_fx_filters(config: dict, width: int, height: int) -> list[str]:
+def build_motion_fx_filters(effect: str, level: str, width: int, height: int) -> list[str]:
     filters = []
-    zoom_pulse = config.get("zoom_pulse", "off")
-    if zoom_pulse != "off":
-        amount = ZOOM_PULSE_AMOUNTS[zoom_pulse]
+    if effect == "zoom_pulse":
+        amount = ZOOM_PULSE_AMOUNTS[level]
         filters.extend([
             (
                 "scale="
@@ -576,9 +672,8 @@ def build_motion_fx_filters(config: dict, width: int, height: int) -> list[str]:
             f"crop={width}:{height}:x='(iw-ow)/2':y='(ih-oh)/2'",
         ])
 
-    punch_zoom = config.get("punch_zoom", "off")
-    if punch_zoom != "off":
-        amount = PUNCH_ZOOM_AMOUNTS[punch_zoom]
+    elif effect == "punch_zoom":
+        amount = PUNCH_ZOOM_AMOUNTS[level]
         filters.extend([
             (
                 "scale="
@@ -588,9 +683,8 @@ def build_motion_fx_filters(config: dict, width: int, height: int) -> list[str]:
             f"crop={width}:{height}:x='(iw-ow)/2':y='(ih-oh)/2'",
         ])
 
-    bass_shake = config.get("bass_shake", "off")
-    if bass_shake != "off":
-        pixels = BASS_SHAKE_PIXELS[bass_shake]
+    elif effect == "bass_shake":
+        pixels = BASS_SHAKE_PIXELS[level]
         filters.extend([
             f"scale={width + pixels * 2}:{height + pixels * 2}",
             (
@@ -600,17 +694,16 @@ def build_motion_fx_filters(config: dict, width: int, height: int) -> list[str]:
             ),
         ])
 
-    flash_hit = config.get("flash_hit", "off")
-    if flash_hit != "off":
-        amount = FLASH_HIT_BRIGHTNESS[flash_hit]
-        filters.append(f"eq=brightness='{amount:.3f}*exp(-10*t)':eval=frame")
+    elif effect == "flash_hit":
+        amount = FLASH_HIT_BRIGHTNESS[level]
+        filters.append(f"eq=brightness='{amount:.3f}*exp(-10*t)':contrast='1+{amount:.3f}*exp(-10*t)':eval=frame")
 
     return filters
 
 
 def prepare_clip_variant(clip: dict, tmpdir: str, variant: str, target_duration: float,
                          random_trim: bool, width: int, height: int, index: int,
-                         speed: float = 1.0, motion_fx: dict | None = None, cancel_check=None) -> str:
+                         speed: float = 1.0, cancel_check=None) -> str:
     src = clip["path"]
     out = os.path.join(tmpdir, f"variant_{index:04d}_{variant}.mp4")
     source_duration = target_duration * speed
@@ -635,7 +728,22 @@ def prepare_clip_variant(clip: dict, tmpdir: str, variant: str, target_duration:
         f"scale={width}:{height}:force_original_aspect_ratio=decrease",
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
     ])
-    filters.extend(build_motion_fx_filters(motion_fx or {}, width, height))
+    motion_fx = clip.get("_motion_fx", "none")
+    motion_level = clip.get("_motion_fx_level", "off")
+    motion_filters = (
+        build_motion_fx_filters(motion_fx, motion_level, width, height)
+        if motion_fx != "none" and motion_level != "off"
+        else []
+    )
+    if motion_filters:
+        clip["_motion_filter"] = ",".join(motion_filters)
+        clip["_motion_filter_applied"] = True
+        logger.info("Segment %03d motion_fx=%s level=%s filter=%s", index, motion_fx, motion_level, clip["_motion_filter"])
+    else:
+        clip["_motion_filter"] = ""
+        clip["_motion_filter_applied"] = False
+        logger.info("Segment %03d motion_fx=none", index)
+    filters.extend(motion_filters)
     filters.extend([
         "setsar=1",
         "format=yuv420p",
@@ -912,6 +1020,7 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
         len(sequence), beat_duration, montage["beat_cut_mode"],
     )
     apply_speed_accents(sequence, montage, bpm, style)
+    motion_fx_report = assign_motion_fx(sequence, montage)
     effects_filter = build_effects_filter(preset, effects, effects_intensity)
     raw_video = os.path.join(tmpdir, "raw_video.mp4")
     chunk_paths = []
@@ -942,22 +1051,35 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
             index = start_index + offset
             durations.append(clip["_segment_duration"])
             logger.info(
-                "Preparing segment %d/%d beat_count=%d source=%s speed=%.2fx tmp_size_bytes=%d",
-                index, len(sequence), clip["_beat_count"], clip["path"], clip["_speed"], dir_size_bytes(tmpdir),
+                "Preparing segment %d/%d beat_count=%d source=%s speed=%.2fx variant=%s motion_fx=%s tmp_size_bytes=%d",
+                index, len(sequence), clip["_beat_count"], clip["path"], clip["_speed"], clip["_variant"],
+                clip.get("_motion_fx", "none"), dir_size_bytes(tmpdir),
             )
             try:
                 prepared.append(prepare_clip_variant(
                     clip, tmpdir, clip["_variant"], clip["_segment_duration"],
                     montage["allow_random_trim"], width, height, index, clip["_speed"],
-                    motion_fx=montage, cancel_check=cancel_check,
+                    cancel_check=cancel_check,
                 ))
             except Exception as exc:
-                logger.warning("Segment %d primary variant failed: %s; retrying normal/no trim", index, exc)
+                if clip.get("_motion_fx", "none") != "none":
+                    logger.warning("Motion FX failed for segment %d, retrying without Motion FX: %s", index, exc)
+                else:
+                    logger.warning("Segment %d primary variant failed: %s; retrying normal/no trim", index, exc)
                 try:
+                    retry_clip = {
+                        **clip,
+                        "_motion_fx": "none",
+                        "_motion_fx_level": "off",
+                        "_motion_filter": "",
+                        "_motion_filter_applied": False,
+                    }
                     prepared.append(prepare_clip_variant(
-                        clip, tmpdir, "normal", clip["_segment_duration"],
-                        False, width, height, index, 1.0, motion_fx=None, cancel_check=cancel_check,
+                        retry_clip, tmpdir, "normal", clip["_segment_duration"],
+                        False, width, height, index, 1.0, cancel_check=cancel_check,
                     ))
+                    clip["_motion_filter_applied"] = False
+                    clip["_motion_filter"] = ""
                 except Exception as retry_exc:
                     logger.error("Segment %d skipped after retry failure: %s", index, retry_exc, exc_info=True)
                     durations.pop()
@@ -1008,6 +1130,7 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
         if not raw_ok:
             break
         chunk_paths.append(chunk_output)
+    motion_fx_report_path = write_motion_fx_report(tmpdir, motion_fx_report, sequence)
     raw_ok = bool(chunk_paths)
     if raw_ok:
         if len(chunk_paths) == 1:
@@ -1080,4 +1203,5 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
         "file_size_gb": round(file_size, 2),
         "output": output_path,
         "segment_duration": round(beat_duration, 3),
+        "motion_fx_report": motion_fx_report_path,
     }
