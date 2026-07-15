@@ -295,9 +295,11 @@ def choose_next_clip(current: dict, candidates: list, recent_paths: list, usage_
 
     cooldown_size = min(4, max(2, len(candidates) - 1)) if len(candidates) >= 3 else 1
     cooling_down = set(recent_paths[-cooldown_size:])
-    available = [clip for clip in candidates if clip["path"] not in cooling_down]
+    unused = [clip for clip in candidates if usage_counts.get(clip["path"], 0) == 0]
+    coverage_pool = unused or candidates
+    available = [clip for clip in coverage_pool if clip["path"] not in cooling_down]
     if not available:
-        available = [clip for clip in candidates if clip["path"] != current["path"]] or candidates
+        available = [clip for clip in coverage_pool if clip["path"] != current["path"]] or coverage_pool
     visually_varied = [clip for clip in available if similarity_penalty(current, clip) == 0]
     if visually_varied:
         available = visually_varied
@@ -417,15 +419,56 @@ def normalize_intensity(value: str | None) -> str:
     return value if value in {"soft", "normal", "strong"} else "normal"
 
 
-def choose_segment_beat_count(mode: str, style: str, bpm: float) -> int:
+def choose_segment_beat_count(mode: str, style: str, bpm: float,
+                              recent_beat_counts: list[int] | None = None) -> int:
     if mode != "auto":
         return int(mode.split("_")[0])
-    return random.choices([12, 8, 4], weights=[60, 30, 10], k=1)[0]
+    recent_beat_counts = recent_beat_counts or []
+    choices = [12, 8, 4]
+    weights = [60, 30, 10]
+    if recent_beat_counts[-2:] == [12, 12]:
+        weights[0] = 35
+    elif recent_beat_counts[-2:] == [8, 8]:
+        weights[1] = 15
+    if recent_beat_counts and recent_beat_counts[-1] == 4:
+        weights[2] = 0
+    return random.choices(choices, weights=weights, k=1)[0]
 
 
 def segment_duration_for_beat_count(bpm: float, beat_count: int) -> float:
     beat_duration = 60.0 / bpm if bpm > 0 else 0.5
     return max(2.0, beat_duration * beat_count)
+
+
+def duration_aware_segment(clip: dict, mode: str, style: str, bpm: float,
+                           recent_beat_counts: list[int]) -> tuple[int, float, bool]:
+    preferred = choose_segment_beat_count(mode, style, bpm, recent_beat_counts)
+    fallback_order = {
+        16: [16, 12, 8, 4],
+        12: [12, 8, 4],
+        8: [8, 4],
+        4: [4],
+    }[preferred]
+    safe_duration = max(0.25, float(clip["duration"]) - 0.08)
+    for beat_count in fallback_order:
+        duration = segment_duration_for_beat_count(bpm, beat_count)
+        if duration <= safe_duration + 0.02:
+            return beat_count, duration, beat_count != preferred
+    beat_count = 4
+    return beat_count, min(segment_duration_for_beat_count(bpm, beat_count), safe_duration), True
+
+
+def output_dimensions() -> tuple[int, int]:
+    def even_env(name: str, default: int) -> int:
+        try:
+            value = int(os.environ.get(name, str(default)))
+        except ValueError:
+            logger.warning("Invalid %s; using %d", name, default)
+            value = default
+        value = max(320, value)
+        return value if value % 2 == 0 else value - 1
+
+    return even_env("OUTPUT_WIDTH", 1920), even_env("OUTPUT_HEIGHT", 1080)
 
 
 def resolve_speed_accents(config: dict, bpm: float, style: str) -> tuple[float, float]:
@@ -501,11 +544,30 @@ def assign_motion_fx(sequence: list, config: dict) -> dict:
             clip["_motion_fx_debug_forced"] = True
     else:
         available = list(range(len(sequence)))
-        random.shuffle(available)
+        assigned = set()
         for effect, level in enabled:
             desired = min(len(available), max(1, round(len(sequence) * MOTION_FX_RATES[level])))
-            selected = available[:desired]
-            available = available[desired:]
+            candidates = list(available)
+            random.shuffle(candidates)
+            if effect == "zoom_pulse":
+                candidates.sort(key=lambda index: sequence[index].get("_segment_duration", 0.0), reverse=True)
+            elif effect in {"punch_zoom", "flash_hit"}:
+                candidates.sort(key=lambda index: sequence[index].get("_segment_duration", 0.0))
+            else:
+                candidates.sort(
+                    key=lambda index: (
+                        sequence[index].get("_segment_duration", 0.0),
+                        -sequence[index].get("motion", 0.0),
+                    )
+                )
+            spaced = [
+                index for index in candidates
+                if not any(abs(index - previous) <= 1 for previous in assigned)
+            ]
+            selected = (spaced + [index for index in candidates if index not in spaced])[:desired]
+            selected_set = set(selected)
+            available = [index for index in available if index not in selected_set]
+            assigned.update(selected_set)
             for index in selected:
                 sequence[index]["_motion_fx"] = effect
                 sequence[index]["_motion_fx_level"] = level
@@ -551,6 +613,7 @@ def write_motion_fx_report(tmpdir: str, report: dict, sequence: list) -> str:
                 "beat_count": clip.get("_beat_count"),
                 "duration": round(float(clip.get("_segment_duration", 0.0)), 3),
                 "speed": round(float(clip.get("_speed", 1.0)), 3),
+                "trim_start": clip.get("_trim_start"),
                 "variant": clip.get("_variant"),
                 "motion_fx": clip.get("_motion_fx", "none"),
                 "motion_fx_level": clip.get("_motion_fx_level", "off"),
@@ -701,6 +764,20 @@ def build_motion_fx_filters(effect: str, level: str, width: int, height: int) ->
     return filters
 
 
+def trim_start_for_use(clip: dict, source_duration: float, random_trim: bool) -> float:
+    available_start = max(0.0, float(clip["duration"]) - source_duration)
+    if not random_trim or available_start <= 0.25:
+        return 0.0
+    use_ordinal = max(1, int(clip.get("_source_use_ordinal", 1)))
+    use_total = max(1, int(clip.get("_source_use_total", 1)))
+    if use_total == 1:
+        return random.uniform(0, available_start)
+    position = ((use_ordinal - 1) % use_total) / max(1, use_total - 1)
+    base_start = position * available_start
+    jitter = min(0.20, available_start * 0.08)
+    return min(available_start, max(0.0, base_start + random.uniform(-jitter, jitter)))
+
+
 def prepare_clip_variant(clip: dict, tmpdir: str, variant: str, target_duration: float,
                          random_trim: bool, width: int, height: int, index: int,
                          speed: float = 1.0, cancel_check=None) -> str:
@@ -714,10 +791,14 @@ def prepare_clip_variant(clip: dict, tmpdir: str, variant: str, target_duration:
         )
         speed = 1.0
         source_duration = target_duration
-    available_start = max(0.0, clip["duration"] - source_duration)
-    start = random.uniform(0, available_start) if random_trim and available_start > 0.25 else 0.0
+    if source_duration > clip["duration"] + 0.001:
+        raise RuntimeError(
+            f"Source clip is too short: duration={clip['duration']:.3f}s required={source_duration:.3f}s"
+        )
+    start = trim_start_for_use(clip, source_duration, random_trim)
+    clip["_trim_start"] = round(start, 3)
     filters = [
-        f"trim=start={start:.3f}:duration={source_duration:.3f}",
+        f"trim=duration={source_duration:.3f}",
         f"setpts=(PTS-STARTPTS)/{speed:.2f}" if speed > 1.0 else "setpts=PTS-STARTPTS",
     ]
     if "mirror" in variant:
@@ -748,8 +829,9 @@ def prepare_clip_variant(clip: dict, tmpdir: str, variant: str, target_duration:
         "setsar=1",
         "format=yuv420p",
     ])
+    input_seek = ["-ss", f"{start:.3f}"] if start > 0.001 else []
     cmd = [
-        "ffmpeg", "-y", "-stream_loop", "-1", "-i", src,
+        "ffmpeg", "-y", *input_seek, "-i", src,
         "-vf", ",".join(filters), "-an", "-r", "30",
         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
         "-t", f"{target_duration:.3f}", out,
@@ -757,7 +839,10 @@ def prepare_clip_variant(clip: dict, tmpdir: str, variant: str, target_duration:
     result = run_ffmpeg(cmd, f"Variant segment {index}", 240, cancel_check=cancel_check)
     if result.returncode != 0:
         raise RuntimeError("Ошибка подготовки видеоклипа")
-    logger.info("Prepared segment %d output=%s size_bytes=%d", index, out, os.path.getsize(out))
+    logger.info(
+        "Prepared segment %d output=%s trim_start=%.3f source_duration=%.3f size_bytes=%d",
+        index, out, start, source_duration, os.path.getsize(out),
+    )
     return out
 
 
@@ -958,6 +1043,27 @@ def concat_video_files(paths: list[str], tmpdir: str, output_path: str,
     return result.returncode == 0, stderr
 
 
+def mux_chunk_files_with_audio(paths: list[str], tmpdir: str, audio_path: str,
+                               output_path: str, cancel_check=None) -> tuple[bool, str]:
+    concat_list = os.path.join(tmpdir, "concat_chunks_final_output.txt")
+    with open(concat_list, "w", encoding="utf-8") as concat_file:
+        for path in paths:
+            concat_file.write(f"file '{path}'\n")
+    cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list, "-i", audio_path,
+        "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "320k",
+        "-shortest", output_path,
+    ]
+    final_timeout = ffmpeg_timeout("FINAL_RENDER_TIMEOUT_SECONDS")
+    logger.info(
+        "Final render direct chunk mux: chunks=%d audio=%s output=%s timeout=%ss tmp_size_bytes=%d",
+        len(paths), audio_path, output_path, final_timeout, dir_size_bytes(tmpdir),
+    )
+    result = run_ffmpeg(cmd, "Final render direct chunk mux", final_timeout, cancel_check=cancel_check)
+    stderr = result.stderr.decode(errors="replace") if result.stderr else ""
+    return result.returncode == 0, stderr
+
+
 def build_video(clips: list, audio_path: str, style: str, user_overrides: dict | None,
                 tmpdir: str, output_path: str, progress_callback=None,
                 montage_config: dict | None = None, visualizer_config: dict | None = None,
@@ -984,40 +1090,66 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
         progress_callback(f"30% Audio and BPM analyzed: {bpm:.0f} BPM, {audio_duration:.1f} sec.")
 
     beat_duration = 60.0 / bpm if bpm > 0 else 0.5
-    width, height = clips[0]["width"], clips[0]["height"]
+    width, height = output_dimensions()
+    logger.info(
+        "Output normalized to %dx%d at 30fps; source resolutions=%s",
+        width, height, sorted({f"{clip['width']}x{clip['height']}" for clip in clips}),
+    )
     target_energy = float(np.mean([clip.get("visual_energy", 0) for clip in clips]))
     sequence = []
     recent_paths = []
+    recent_beat_counts = []
     usage_counts = {clip["path"]: 0 for clip in clips}
     current = random.choice(clips)
     elapsed = 0.0
     overlap = 0.35 if montage["transition_style"] == "crossfade" else 0.0
     while elapsed < audio_duration:
-        beat_count = choose_segment_beat_count(montage["beat_cut_mode"], style, bpm)
-        target_duration = segment_duration_for_beat_count(bpm, beat_count)
-        needed_duration = audio_duration - elapsed + (overlap if sequence else 0.0)
-        segment_duration = min(target_duration, max(2.0, needed_duration))
         selected = current if not sequence else choose_next_clip(
             current, clips, recent_paths, usage_counts, montage["clip_order_mode"], target_energy
         )
+        beat_count, target_duration, duration_fallback = duration_aware_segment(
+            selected, montage["beat_cut_mode"], style, bpm, recent_beat_counts
+        )
+        needed_duration = audio_duration - elapsed + (overlap if sequence else 0.0)
+        minimum_segment = overlap + 0.10 if sequence and overlap else 0.25
+        segment_duration = min(target_duration, max(minimum_segment, needed_duration))
         selected = {
             **selected,
             "_segment_duration": segment_duration,
             "_beat_count": beat_count,
+            "_duration_fallback": duration_fallback,
+            "_source_use_ordinal": usage_counts.get(selected["path"], 0) + 1,
             "_variant": random.choice(allowed_variants(montage)),
         }
         sequence.append(selected)
         recent_paths.append(selected["path"])
+        recent_beat_counts.append(beat_count)
         usage_counts[selected["path"]] = usage_counts.get(selected["path"], 0) + 1
         logger.info(
-            "Segment %d beat_count=%d duration=%.3f source=%s variant=%s recent_sources=%s",
-            len(sequence), beat_count, segment_duration, selected["path"], selected["_variant"], recent_paths[-4:],
+            "Segment %d beat_count=%d duration=%.3f source_duration=%.3f duration_fallback=%s "
+            "source=%s source_use=%d variant=%s recent_sources=%s",
+            len(sequence), beat_count, segment_duration, selected["duration"], duration_fallback,
+            selected["path"], selected["_source_use_ordinal"], selected["_variant"], recent_paths[-4:],
         )
         current = selected
         elapsed += segment_duration - (overlap if len(sequence) > 1 else 0.0)
+    for selected in sequence:
+        selected["_source_use_total"] = usage_counts[selected["path"]]
+    selected_paths = {selected["path"] for selected in sequence}
+    unused_paths = sorted(os.path.basename(clip["path"]) for clip in clips if clip["path"] not in selected_paths)
+    beat_count_summary = {
+        beat_count: sum(1 for selected in sequence if selected["_beat_count"] == beat_count)
+        for beat_count in (4, 8, 12, 16)
+    }
+    duration_fallbacks = sum(1 for selected in sequence if selected.get("_duration_fallback"))
     logger.info(
-        "Final sequence length: %d segments, beat_duration %.3fs mode=%s",
-        len(sequence), beat_duration, montage["beat_cut_mode"],
+        "Final sequence length=%d unique_sources=%d/%d repeated_segments=%d beat_duration=%.3fs mode=%s unused=%s",
+        len(sequence), len(selected_paths), len(clips), len(sequence) - len(selected_paths),
+        beat_duration, montage["beat_cut_mode"], unused_paths,
+    )
+    logger.info(
+        "Segment rhythm summary: beat_counts=%s duration_fallbacks=%d",
+        beat_count_summary, duration_fallbacks,
     )
     apply_speed_accents(sequence, montage, bpm, style)
     motion_fx_report = assign_motion_fx(sequence, montage)
@@ -1025,6 +1157,8 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
     raw_video = os.path.join(tmpdir, "raw_video.mp4")
     chunk_paths = []
     last_stderr = ""
+    rendered_source_paths = set()
+    rendered_segments = 0
     chunk_size = 40
     total_chunks = max(1, (len(sequence) + chunk_size - 1) // chunk_size)
     for chunk_number, start_index in enumerate(range(0, len(sequence), chunk_size), start=1):
@@ -1033,6 +1167,8 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
         chunk = sequence[start_index:start_index + chunk_size]
         prepared = []
         durations = []
+        chunk_source_paths = set()
+        chunk_rendered_segments = 0
         logger.info(
             "Prepare chunk %d/%d segments=%d tmp_size_bytes=%d",
             chunk_number, total_chunks, len(chunk), dir_size_bytes(tmpdir),
@@ -1061,6 +1197,8 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
                     montage["allow_random_trim"], width, height, index, clip["_speed"],
                     cancel_check=cancel_check,
                 ))
+                chunk_source_paths.add(clip["path"])
+                chunk_rendered_segments += 1
             except Exception as exc:
                 if clip.get("_motion_fx", "none") != "none":
                     logger.warning("Motion FX failed for segment %d, retrying without Motion FX: %s", index, exc)
@@ -1078,6 +1216,8 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
                         retry_clip, tmpdir, "normal", clip["_segment_duration"],
                         False, width, height, index, 1.0, cancel_check=cancel_check,
                     ))
+                    chunk_source_paths.add(clip["path"])
+                    chunk_rendered_segments += 1
                     clip["_motion_filter_applied"] = False
                     clip["_motion_filter"] = ""
                 except Exception as retry_exc:
@@ -1130,13 +1270,66 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
         if not raw_ok:
             break
         chunk_paths.append(chunk_output)
+        rendered_source_paths.update(chunk_source_paths)
+        rendered_segments += chunk_rendered_segments
+    unique_clips_used = len(rendered_source_paths)
+    repeated_segments = max(0, rendered_segments - unique_clips_used)
+    unused_source_clips = sorted(
+        os.path.basename(clip["path"]) for clip in clips if clip["path"] not in rendered_source_paths
+    )
+    logger.info(
+        "Render coverage: accepted_sources=%d unique_sources_used=%d segments_rendered=%d "
+        "repeated_segments=%d unused_sources=%s",
+        len(clips), unique_clips_used, rendered_segments, repeated_segments, unused_source_clips,
+    )
     motion_fx_report_path = write_motion_fx_report(tmpdir, motion_fx_report, sequence)
     raw_ok = bool(chunk_paths)
-    if raw_ok:
-        if len(chunk_paths) == 1:
-            raw_video = chunk_paths[0]
-        else:
-            raw_ok, last_stderr = concat_video_files(chunk_paths, tmpdir, raw_video, audio_duration, cancel_check=cancel_check)
+    if not raw_ok:
+        stderr_summary = (last_stderr.strip() or "ffmpeg did not return an error message")[-800:]
+        raise RuntimeError(f"?????? ?????? ?????: {stderr_summary}")
+
+    if not visualizer["enabled"]:
+        if progress_callback:
+            progress_callback("75% Chunks assembled. Visualizer skipped.")
+            progress_callback("90% Final render.")
+        if status_callback:
+            status_callback("final_render", 90, "Final render direct chunk mux started")
+        final_render_start = time.time()
+        raw_ok, last_stderr = mux_chunk_files_with_audio(
+            chunk_paths, tmpdir, audio_path, output_path, cancel_check=cancel_check
+        )
+        if not raw_ok:
+            stderr_summary = (last_stderr.strip() or "ffmpeg did not return an error message")[-1200:]
+            raise RuntimeError(f"Final render direct chunk mux failed: {stderr_summary}")
+        logger.info(
+            "Final render direct chunk mux completed output_size_bytes=%d elapsed_seconds=%.1f",
+            os.path.getsize(output_path), time.time() - final_render_start,
+        )
+        file_size = os.path.getsize(output_path) / (1024 * 1024 * 1024)
+        minutes, seconds = divmod(int(audio_duration), 60)
+        return {
+            "duration": f"{minutes}:{seconds:02d}",
+            "bpm": round(bpm),
+            "clips_used": unique_clips_used,
+            "unique_clips_used": unique_clips_used,
+            "source_clips_available": len(clips),
+            "segments_rendered": rendered_segments,
+            "repeated_segments": repeated_segments,
+            "unused_source_clips": unused_source_clips,
+            "output_resolution": f"{width}x{height}",
+            "output_fps": 30,
+            "duration_fallbacks": duration_fallbacks,
+            "beat_count_summary": beat_count_summary,
+            "file_size_gb": round(file_size, 2),
+            "output": output_path,
+            "segment_duration": round(beat_duration, 3),
+            "motion_fx_report": motion_fx_report_path,
+        }
+
+    if len(chunk_paths) == 1:
+        raw_video = chunk_paths[0]
+    else:
+        raw_ok, last_stderr = concat_video_files(chunk_paths, tmpdir, raw_video, audio_duration, cancel_check=cancel_check)
     if not raw_ok:
         stderr_summary = (last_stderr.strip() or "ffmpeg did not return an error message")[-800:]
         raise RuntimeError(f"?????? ?????? ?????: {stderr_summary}")
@@ -1199,7 +1392,16 @@ def build_video(clips: list, audio_path: str, style: str, user_overrides: dict |
     return {
         "duration": f"{minutes}:{seconds:02d}",
         "bpm": round(bpm),
-        "clips_used": len(sequence),
+        "clips_used": unique_clips_used,
+        "unique_clips_used": unique_clips_used,
+        "source_clips_available": len(clips),
+        "segments_rendered": rendered_segments,
+        "repeated_segments": repeated_segments,
+        "unused_source_clips": unused_source_clips,
+        "output_resolution": f"{width}x{height}",
+        "output_fps": 30,
+        "duration_fallbacks": duration_fallbacks,
+        "beat_count_summary": beat_count_summary,
         "file_size_gb": round(file_size, 2),
         "output": output_path,
         "segment_duration": round(beat_duration, 3),
