@@ -147,6 +147,7 @@ def run_render_job(job_id: str, payload: dict):
         logger.info("Number of clips analyzed: %d", len(clips))
         if not clips:
             raise ValueError("Could not analyze any video clips")
+        rejected_clips = len(video_clips) - len(clips)
 
         update_status("preparing_segments", 30, "Building montage and preparing segments")
         output_path = os.path.join(tmpdir, "FINAL_VIDEO.mp4")
@@ -175,6 +176,14 @@ def run_render_job(job_id: str, payload: dict):
             duration=result["duration"],
             bpm=result["bpm"],
             clips_used=result["clips_used"],
+            unique_clips_used=result["unique_clips_used"],
+            source_clips_available=result["source_clips_available"],
+            segments_rendered=result["segments_rendered"],
+            repeated_segments=result["repeated_segments"],
+            clips_rejected=rejected_clips,
+            output_resolution=result["output_resolution"],
+            output_fps=result["output_fps"],
+            duration_fallbacks=result["duration_fallbacks"],
         )
         notify_telegram(
             bot_token,
@@ -183,7 +192,11 @@ def run_render_job(job_id: str, payload: dict):
             "VIDEO READY!\n\n"
             f"Duration: {result['duration']}\n"
             f"BPM: {result['bpm']}\n"
-            f"Clips used: {result['clips_used']}\n"
+            f"Unique source clips used: {result['unique_clips_used']}/{result['source_clips_available']}\n"
+            f"Montage segments rendered: {result['segments_rendered']}\n"
+            f"Repeated segments: {result['repeated_segments']}\n"
+            f"Rejected clips: {rejected_clips}\n"
+            f"Output: {result['output_resolution']} at {result['output_fps']} fps\n"
             f"File size: {result['file_size_gb']} GB\n\n"
             f"Download link:\n{download_link}\n\n"
             "Send /start for a new video.",
